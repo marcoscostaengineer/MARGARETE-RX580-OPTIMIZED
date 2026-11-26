@@ -71,8 +71,15 @@ dispatches leave their draw's instance count behind them on the card.
 
 Tested so far on an RX 580 with synthetic console mesh programs only (direct and indirect draws
 match what the mesh form draws on WARP; both forms pass `dxil.dll`), **not yet with the title**.
-Expect it slower than mesh shaders, and on an RX 580 far below 30 fps. Also missing on such
-cards: compute programs that need 32-lane waves are still refused there (GCN has 64 only).
+Expect it slower than mesh shaders, and on an RX 580 far below 30 fps.
+
+GCN also runs waves of 64 lanes alone, where the title's wave32 compute programs whose lanes
+read each other's asked for waves of 32 (`WaveSize(32)`) and were refused. They now run two
+console waves to a host wave of 64, each half on its own: lane reads stay in the half, ballots
+take its 32 bits, votes, first-lane reads and wave reductions are taken for each half
+(`Lower::paired`; the translator is told the GPU's narrowest wave). Tested on an RX 580 with
+synthetic programs (row permutations, first-lane reads, lane masks counted, f64 wave sums; four
+console waves in two host waves), not yet with the title.
 
 What is known to be wrong:
 

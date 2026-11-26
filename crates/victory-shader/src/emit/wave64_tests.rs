@@ -1210,6 +1210,11 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
     }
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let Ok(host) = Host::new(false) else { return };
+    if super::valu_tests::hardware_min_wave() > 32 {
+        // (GCN runs waves of 64 alone: the 32-lane program is for hosts like NVIDIA's)
+        eprintln!("the hardware device runs no 32-lane waves; GPU part skipped");
+        return;
+    }
     let (root, pso) = host.compute_pipeline(&shader).expect("the host makes the 32-lane pipeline");
     for (count, active, expected_or) in [(45u32, 45usize, 0x007F_FFFFu32), (1, 1, 1), (33, 33, 0x1_FFFF), (0, 64, u32::MAX)] {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];

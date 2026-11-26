@@ -319,6 +319,13 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// A console wave32 program on a host of 64-lane waves alone (GCN): host lanes 0..31 and
+    /// 32..63 are two console waves. Lane numbers are the console's (0..31) everywhere; lane
+    /// reads add this half's first lane ([`Lower::half_base`]), ballots take this half's 32 bits,
+    /// and wave reductions, votes and first-lane reads are taken for each half on its own.
+    paired: bool,
+    /// See [`Lower::half_base`].
+    half_base: Option<V>,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh, compute form (`mesh_sub`): the byte where the group's record starts.
@@ -1439,6 +1446,27 @@ pub fn set_host_max_wave(lanes: u32) {
     HOST_MAX_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The narrowest wave the host GPU runs (0: not known); see [`set_host_min_wave`].
+static HOST_MIN_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The host GPU's `WaveLaneCountMin`: 64 (GCN: RX 400/500, Vega) has no 32-lane waves, so a
+/// console wave32 program whose lanes talk to each other runs two console waves to a host wave
+/// of 64, each half on its own (`Lower::paired`), instead of being refused (`WaveSize(32)`).
+pub fn set_host_min_wave(lanes: u32) {
+    HOST_MIN_WAVE.store(lanes, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn host_min_wave() -> u32 {
+    THREAD_MIN_WAVE
+        .get()
+        .unwrap_or_else(|| HOST_MIN_WAVE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+thread_local! {
+    /// A test's choice for [`host_min_wave`], for its thread only.
+    pub(super) static THREAD_MIN_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1516,9 +1544,10 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 5] {
+pub fn host_settings() -> [u32; 6] {
     [
         host_max_wave(),
+        host_min_wave(),
         super::shader::view_heap_limit(),
         super::shader::raw_views(),
         host_rdna(),
@@ -1819,6 +1848,8 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let mut console_lanes = false;
+        // see `Lower::paired`
+        let mut paired = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
         // with `split_lds`, LDS accesses in lane branches: the blocks every lane runs, and
@@ -1956,8 +1987,11 @@ impl<'a> Lower<'a> {
                 halves = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
+            // A console wave32 program on a host of 64-lane waves alone: two console waves to a
+            // host wave, each half on its own (`Lower::paired`).
+            paired = console_lanes && wave == 32 && !x.native.wave64 && host_min_wave() == 64;
             if console_lanes || one_wave && s.lds_dwords > 0 {
-                s.wave_size = Some(wave);
+                s.wave_size = Some(if wave == 32 && host_min_wave() == 64 { 64 } else { wave });
             }
         }
         // The title's barriers a thread of the group may never reach, which
@@ -2104,6 +2138,8 @@ impl<'a> Lower<'a> {
             writes_uavs,
             src0: None,
             console_lanes,
+            paired,
+            half_base: None,
             split_lds,
             lds_meet,
             local: exchange.is_some() && LOCAL_WAVES.get(),
@@ -2449,57 +2485,21 @@ impl<'a> Lower<'a> {
             };
         }
         let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        if self.paired {
+            // each half its own reduction: the other half's lanes give the identity
+            let upper = self.upper_half(c);
+            let lower_x = self.s.m.select(c, upper, id, x);
+            let upper_x = self.s.m.select(c, upper, x, id);
+            let lo = self.reduce_once(c, op, prefix, lower_x, float)?;
+            let hi = self.reduce_once(c, op, prefix, upper_x, float)?;
+            let r = self.s.m.select(c, upper, hi, lo);
+            return Ok(if float { self.as_int(r) } else { r });
+        }
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
-        let r = match (op, prefix) {
-            (Op::AddU | Op::AddF, Some(inclusive)) => {
-                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
-                let r = self.s.op(
-                    c,
-                    &format!("wavePrefixOp.{sfx}"),
-                    Attr::NoUnwind,
-                    ty,
-                    121,
-                    &[arg, k0, k1],
-                );
-                if inclusive {
-                    self.s.m.bin(c, Bin::Add, r, arg)
-                } else {
-                    r
-                }
-            }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
-            (Op::Or | Op::And | Op::Xor, None) => {
-                let k = self.s.m.i8(match op {
-                    Op::And => 0,
-                    Op::Or => 1,
-                    _ => 2,
-                });
-                self.s
-                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[arg, k])
-            }
-            (_, None) => {
-                let (code, unsigned) = match op {
-                    Op::AddU => (0, 1),
-                    Op::AddF => (0, 0),
-                    Op::MinU => (2, 1),
-                    Op::MaxU => (3, 1),
-                    Op::MinI | Op::MinF => (2, 0),
-                    _ => (3, 0),
-                };
-                let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
-                self.s.op(
-                    c,
-                    &format!("waveActiveOp.{sfx}"),
-                    Attr::NoUnwind,
-                    ty,
-                    119,
-                    &[arg, k, u],
-                )
-            }
-        };
+        let r = self.reduce_once(c, op, prefix, x, float)?;
         // two host waves of 32 hold the console's 64 lanes: their results combine
         let r = if self.local || self.exchange.as_ref().is_some_and(|e| e.1) {
             // this host wave's own result (and prefix): each wave on its own, or a group of
@@ -2564,6 +2564,63 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
+    /// The host wave's reduction (or prefix) `op` of `x` (i32 bits) in `c`, in the operation's
+    /// type (f32 for float operations).
+    fn reduce_once(&mut self, c: usize, op: super::wave::Op, prefix: Option<bool>, x: V, float: bool) -> Result<V, Why> {
+        use super::wave::Op;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let arg = if float { self.as_float(x) } else { x };
+        let ty = if float { f32t } else { i32t };
+        let sfx = if float { "f32" } else { "i32" };
+        Ok(match (op, prefix) {
+            (Op::AddU | Op::AddF, Some(inclusive)) => {
+                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
+                let r = self.s.op(
+                    c,
+                    &format!("wavePrefixOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    121,
+                    &[arg, k0, k1],
+                );
+                if inclusive {
+                    self.s.m.bin(c, Bin::Add, r, arg)
+                } else {
+                    r
+                }
+            }
+            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (Op::Or | Op::And | Op::Xor, None) => {
+                let k = self.s.m.i8(match op {
+                    Op::And => 0,
+                    Op::Or => 1,
+                    _ => 2,
+                });
+                self.s
+                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[arg, k])
+            }
+            (_, None) => {
+                let (code, unsigned) = match op {
+                    Op::AddU => (0, 1),
+                    Op::AddF => (0, 0),
+                    Op::MinU => (2, 1),
+                    Op::MaxU => (3, 1),
+                    Op::MinI | Op::MinF => (2, 0),
+                    _ => (3, 0),
+                };
+                let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
+                self.s.op(
+                    c,
+                    &format!("waveActiveOp.{sfx}"),
+                    Attr::NoUnwind,
+                    ty,
+                    119,
+                    &[arg, k, u],
+                )
+            }
+        })
+    }
+
     /// `WaveActiveSum` of 64-bit floats (`f64(lo, hi)` in active lanes, `+0.0` elsewhere),
     /// returning the low (`!high`) or high (`high`) 32-bit word.
     fn active_f64_sum(
@@ -2597,6 +2654,30 @@ impl<'a> Lower<'a> {
             .s
             .m
             .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
+        if self.paired {
+            // each half its own sum: the other half's lanes give +0.0
+            let upper = self.upper_half(c);
+            let lower = {
+                let t = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, upper, t)
+            };
+            let mut words = Vec::with_capacity(2);
+            for keep in [lower, upper] {
+                let l = self.s.m.select(c, keep, lo, z);
+                let h = self.s.m.select(c, keep, hi, z);
+                let d = self.s.op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[l, h]);
+                let (k0, k0b) = (self.s.m.i8(0), self.s.m.i8(0));
+                let sum = self.s.op(c, "waveActiveOp.f64", Attr::NoUnwind, f64t, 119, &[d, k0, k0b]);
+                let split = self.s.op(c, "splitDouble.f64", Attr::ReadNone, split_ty, 102, &[sum]);
+                words.push((self.s.m.extract(c, split, 0), self.s.m.extract(c, split, 1)));
+            }
+            let (a, b) = (words[0], words[1]);
+            return Ok(if high {
+                self.s.m.select(c, upper, b.1, a.1)
+            } else {
+                self.s.m.select(c, upper, b.0, a.0)
+            });
+        }
         let arg = self
             .s
             .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi]);
@@ -4094,13 +4175,7 @@ impl<'a> Lower<'a> {
                 let bit = self.boolean(m, at);
                 self.balloting.remove(&lo);
                 let bit = self.launched(at, bit?, lo);
-                let i32t = self.s.t.i32;
-                let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                let r = self
-                    .s
-                    .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
-                self.s.flags |= flags::WAVE_OPS;
-                let mut xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let mut xy = self.ballot(at, bit);
                 if self.exchange.is_some() {
                     // a host wave's ballot is its half's 32 bits: the halves exchange them
                     let b = self.def_block.get(&lo).copied();
@@ -4808,9 +4883,8 @@ impl<'a> Lower<'a> {
             // (a mask ANDed with EXEC: the threads kept for barriers have no bit)
             bit = self.s.m.bin(at, Bin::And, bit, a);
         }
-        let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
-        let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
-        self.s.flags |= flags::WAVE_OPS;
+        let i32t = self.s.t.i32;
+        let some = self.vote(at, bit, true);
         if !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Ok(some);
         }
@@ -4834,10 +4908,7 @@ impl<'a> Lower<'a> {
             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
             let c = self.cur;
             let mine = self.boolean(when, c)?;
-            let i1t = self.s.t.i1;
-            self.s.flags |= flags::WAVE_OPS;
-            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
-            return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
+            return Ok(self.vote(c, mine, any));
         }
         if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Err(WHY);
@@ -5173,7 +5244,8 @@ impl<'a> Lower<'a> {
         let wave = self.s.wave_size.expect("set with console lanes");
         let mask = self.s.m.i32(!(wave - 1));
         let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self.lane_index();
+        // (the host lane: with `paired`, a host wave holds two console waves' threads)
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let f = self.s.m.bin(e, Bin::Add, base, lane);
         self.s.flags |= flags::WAVE_OPS;
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -5362,14 +5434,94 @@ impl<'a> Lower<'a> {
             let m = self.s.m.i32(self.wave() - 1);
             return self.s.m.bin(self.s.entry, Bin::And, f, m);
         }
-        self.s.op(
+        let lane = self.s.op(
             self.cur,
             "waveGetLaneIndex",
             Attr::ReadOnly,
             self.s.t.i32,
             111,
             &[],
-        )
+        );
+        if self.paired {
+            // the console's lane: this half's
+            let k31 = self.s.m.i32(31);
+            return self.s.m.bin(self.cur, Bin::And, lane, k31);
+        }
+        lane
+    }
+
+    /// `paired`: this half's first host lane (0 or 32), made in the entry block.
+    fn half_base(&mut self) -> V {
+        if let Some(b) = self.half_base {
+            return b;
+        }
+        let (e, i32t) = (self.s.entry, self.s.t.i32);
+        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+        let k32 = self.s.m.i32(32);
+        let b = self.s.m.bin(e, Bin::And, lane, k32);
+        self.s.flags |= flags::WAVE_OPS;
+        self.half_base = Some(b);
+        b
+    }
+
+    /// `paired`: whether this lane is in the upper half of its host wave (`at`).
+    fn upper_half(&mut self, at: usize) -> V {
+        let b = self.half_base();
+        let z = self.s.m.i32(0);
+        self.s.m.cmp(at, pred::NE, b, z)
+    }
+
+    /// The ballot of `bit` in `at` as the console's lane mask, low and high dword: with
+    /// `paired`, this half's 32 bits (and no high dword, as wave32 has none).
+    fn ballot(&mut self, at: usize, bit: V) -> (V, V) {
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self.s.op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let (x, y) = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+        if !self.paired {
+            return (x, y);
+        }
+        let upper = self.upper_half(at);
+        let word = self.s.m.select(at, upper, y, x);
+        (word, self.s.m.i32(0))
+    }
+
+    /// `x` of the first active lane of the console wave, in `at` (`waveReadLaneFirst`; with
+    /// `paired`, of this half).
+    fn read_first(&mut self, at: usize, x: V) -> V {
+        let i32t = self.s.t.i32;
+        self.s.flags |= flags::WAVE_OPS;
+        if !self.paired {
+            return self.s.op(at, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
+        }
+        let yes = self.s.m.bool(true);
+        let (word, _) = self.ballot(at, yes);
+        // (this lane is active, so its half has a first lane)
+        let first = self.s.op(at, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[word]);
+        let base = self.half_base();
+        let lane = self.s.m.bin(at, Bin::Add, base, first);
+        self.s.op(at, "waveReadLaneAt.i32", Attr::NoUnwind, i32t, 117, &[x, lane])
+    }
+
+    /// Whether some (`any`) or every (else) active lane of the console wave has `bit`, in `at`
+    /// (`waveAnyTrue`, `waveAllTrue`; with `paired`, of this half).
+    fn vote(&mut self, at: usize, bit: V, any: bool) -> V {
+        let i1t = self.s.t.i1;
+        self.s.flags |= flags::WAVE_OPS;
+        if !self.paired {
+            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+            return self.s.op(at, name, Attr::NoUnwind, i1t, code, &[bit]);
+        }
+        let asked = if any {
+            bit
+        } else {
+            let t = self.s.m.bool(true);
+            self.s.m.bin(at, Bin::Xor, bit, t)
+        };
+        let (word, _) = self.ballot(at, asked);
+        let z = self.s.m.i32(0);
+        self.s.m.cmp(at, if any { pred::NE } else { pred::EQ }, word, z)
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
@@ -5491,6 +5643,22 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         self.s.flags |= flags::WAVE_OPS;
+        if self.paired {
+            // the first lane of this half where `guard` holds (console lanes; `read_lane` adds
+            // the half's first host lane)
+            let first = self.read_first(c, x);
+            let Some(g) = guard else {
+                return (first, self.s.m.bool(true));
+            };
+            let (word, _) = self.ballot(c, g);
+            let z = self.s.m.i32(0);
+            let any = self.s.m.cmp(c, pred::NE, word, z);
+            let nth = self.s.op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[word]);
+            let me = self.lane_index();
+            let lane = self.s.m.select(c, any, nth, me);
+            let at = self.read_lane(x, lane);
+            return (self.s.m.select(c, any, at, first), any);
+        }
         let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[x]);
         let Some(g) = guard else {
             return (first, self.s.m.bool(true));
@@ -5515,6 +5683,13 @@ impl<'a> Lower<'a> {
     }
 
     fn read_lane(&mut self, x: V, lane: V) -> V {
+        let lane = if self.paired {
+            // a console lane of this half
+            let base = self.half_base();
+            self.s.m.bin(self.cur, Bin::Add, base, lane)
+        } else {
+            lane
+        };
         self.s.op(
             self.cur,
             "waveReadLaneAt.i32",
@@ -7435,9 +7610,7 @@ impl<'a> Lower<'a> {
                 self.x.p.blocks[b].insts.iter().any(writes)
             });
             if per_lane {
-                self.s.flags |= flags::WAVE_OPS;
-                let i32t = self.s.t.i32;
-                let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[d]);
+                let first = self.read_first(c, d);
                 d = if self.s.pixel && super::helper_own() {
                     let helper = self.helper_lane();
                     self.s.m.select(c, helper, d, first)
@@ -9449,13 +9622,7 @@ impl<'a> Lower<'a> {
                     // Ballot the console EXEC guard as well as the host's active
                     // invocations. Never shuffle from an inactive host lane.
                     let enabled = guard.unwrap_or_else(|| self.s.m.bool(true));
-                    let i32t = self.s.t.i32;
-                    let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
-                    let mask = self.s.op(
-                        c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[enabled],
-                    );
-                    let lo = self.s.m.extract(c, mask, 0);
-                    let hi = self.s.m.extract(c, mask, 1);
+                    let (lo, hi) = self.ballot(c, enabled);
                     let lower = self.s.m.cmp(c, pred::IULT, src, k32);
                     let word = self.s.m.select(c, lower, lo, hi);
                     let bit = self.s.m.bin(c, Bin::And, src, k31);
