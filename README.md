@@ -58,6 +58,21 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
 | `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
 | `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+| `VICTORY_MESH_SUBSTITUTE` | Mesh programs on GPUs without mesh shaders (below); `1` on any GPU, `0` never |
+| `VICTORY_MESH_RING_MB` | The buffer of those programs' records (512 by default) |
+
+### GPUs without mesh shaders (branch `feat/mesh-shader-fallback`)
+
+The title draws its world with mesh shaders, which GCN cards (RX 400/500, Vega), Pascal and
+older do not have. On such a card each mesh program now runs in a compute form that writes its
+vertices and primitives into a buffer, and a vertex program the translator makes draws them
+(`victory_shader::emit::mesh_sub`, `crates/victory-gpu/src/mesh_ring.rs`); indirect mesh
+dispatches leave their draw's instance count behind them on the card.
+
+Tested so far on an RX 580 with synthetic console mesh programs only (direct and indirect draws
+match what the mesh form draws on WARP; both forms pass `dxil.dll`), **not yet with the title**.
+Expect it slower than mesh shaders, and on an RX 580 far below 30 fps. Also missing on such
+cards: compute programs that need 32-lane waves are still refused there (GCN has 64 only).
 
 What is known to be wrong:
 

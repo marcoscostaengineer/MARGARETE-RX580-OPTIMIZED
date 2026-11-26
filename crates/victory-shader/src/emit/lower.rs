@@ -5236,6 +5236,29 @@ impl<'a> Lower<'a> {
         if compute {
             self.s.mesh_compute = true;
             self.s.mesh = Some(mesh);
+            // Groups past the most the records hold return at once; the first thread of every
+            // other one raises the draw's instances to its group + 1 (`mesh_sub::SLOT_MESH_ARGS`).
+            let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+                unreachable!()
+            };
+            let c = self.cur;
+            let most = super::mesh_sub::most_groups(&mut self.s, c);
+            let inside = self.s.m.cmp(c, pred::IULT, group, most);
+            let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
+            self.s.m.terminate(c, Term::CondBr(inside, body, done));
+            self.s.m.terminate(done, Term::Ret);
+            // (What is made in the entry block from here on goes to the body.)
+            self.s.entry = body;
+            self.cur = body;
+            let flat = self.mesh_thread();
+            let zero = self.s.m.i32(0);
+            let first = self.s.m.cmp(body, pred::EQ, flat, zero);
+            let one = self.s.m.i32(1);
+            let instances = self.s.m.bin(body, Bin::Add, group, one);
+            let at = self.begin_guarded(Some(first));
+            let c = self.cur;
+            super::mesh_sub::raise_instances(&mut self.s, c, instances);
+            self.end_guarded(at, &[]);
         } else {
             self.s
                 .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);

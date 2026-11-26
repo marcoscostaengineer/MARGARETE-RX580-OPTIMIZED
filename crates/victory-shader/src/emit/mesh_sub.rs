@@ -30,6 +30,19 @@ use super::shader::Shader;
 /// reads them from (`u<SLOT_MESH_OUT>` in `ROOT_CBV_SPACE`).
 pub const SLOT_MESH_OUT: u8 = 252;
 
+/// The root UAV of the dispatch's argument slot ([`ARGS_BYTES`] bytes): dwords 0 to 3 the
+/// arguments of the draw that follows (vertices an instance, instances, 0, 0), dword 4 the most
+/// groups its records hold. The host writes the slot before the dispatch with no instances; the
+/// first thread of every group that runs raises the instances to its group + 1, so an indirect
+/// dispatch leaves the draw of its groups behind it. Groups past the most return at once.
+pub const SLOT_MESH_ARGS: u8 = 251;
+/// Byte of the instance count in the argument slot.
+pub const ARGS_INSTANCES: u32 = 4;
+/// Byte of the most groups in the argument slot.
+pub const ARGS_MOST: u32 = 16;
+/// Bytes of an argument slot.
+pub const ARGS_BYTES: u32 = 32;
+
 thread_local! {
     static AS_COMPUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The layout of the last mesh program lowered in its compute form here.
@@ -193,7 +206,27 @@ pub(crate) fn store(s: &mut Shader, block: usize, byte: V, values: &[V]) {
 
 /// Loads `n` dwords (at most four) at `byte` of the record buffer, as i32.
 fn load(s: &mut Shader, block: usize, byte: V, n: u32) -> Vec<V> {
-    let h = s.root_uav_handle(SLOT_MESH_OUT);
+    load_from(s, block, SLOT_MESH_OUT, byte, n)
+}
+
+/// The most groups the dispatch's records hold ([`ARGS_MOST`]).
+pub(crate) fn most_groups(s: &mut Shader, block: usize) -> V {
+    let byte = s.m.i32(ARGS_MOST);
+    load_from(s, block, SLOT_MESH_ARGS, byte, 1)[0]
+}
+
+/// Raises the draw's instances to `instances` ([`ARGS_INSTANCES`]).
+pub(crate) fn raise_instances(s: &mut Shader, block: usize, instances: V) {
+    let h = s.root_uav_handle(SLOT_MESH_ARGS);
+    let i32t = s.t.i32;
+    let undef = s.m.undef(i32t);
+    let (umax, byte) = (s.m.i32(7), s.m.i32(ARGS_INSTANCES));
+    s.op(block, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[h, umax, byte, undef, undef, instances]);
+}
+
+/// Loads `n` dwords (at most four) at `byte` of the raw root UAV `slot`, as i32.
+fn load_from(s: &mut Shader, block: usize, slot: u8, byte: V, n: u32) -> Vec<V> {
+    let h = s.root_uav_handle(slot);
     let undef = s.m.undef(s.t.i32);
     let mask = s.m.i8(((1u32 << n) - 1) as u8);
     let align = s.m.i32(4);

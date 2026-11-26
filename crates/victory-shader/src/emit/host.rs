@@ -753,6 +753,10 @@ pub struct Substitute {
     pub roots: Vec<(u32, Root)>,
     /// The compute root parameter of `u<SLOT_MESH_OUT>`.
     pub uav_param: u32,
+    /// The compute root parameter of `u<SLOT_MESH_ARGS>`.
+    pub args_param: u32,
+    /// Draw with the arguments the compute form left (`ExecuteIndirect`), not `groups`.
+    pub indirect: bool,
     /// The graphics root parameter of `u<SLOT_MESH_OUT>`.
     pub graphics_uav_param: u32,
     pub groups: u32,
@@ -911,6 +915,7 @@ impl Host {
             let sampler_size =
                 dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) as usize;
             let mut keep = Vec::new();
+            let mut keep_sigs: Vec<ID3D12CommandSignature> = Vec::new();
             for (i, &(tw, th, texels)) in d.textures.iter().enumerate() {
                 let tex = make(
                     D3D12_HEAP_TYPE_DEFAULT,
@@ -1054,6 +1059,31 @@ impl Host {
                     None,
                 )?;
                 let at = records.GetGPUVirtualAddress();
+                use super::mesh_sub::{ARGS_BYTES, ARGS_MOST};
+                let args = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &D3D12_RESOURCE_DESC {
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..buf_desc(u64::from(ARGS_BYTES))
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                )?;
+                let args_at = args.GetGPUVirtualAddress();
+                let list2: ID3D12GraphicsCommandList2 = list.cast().map_err(err)?;
+                let words = [sub.layout.vertices_per_group(), 0, 0, 0, sub.groups];
+                let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words
+                    .iter()
+                    .enumerate()
+                    .map(|(n, &v)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: args_at + 4 * n as u64, Value: v })
+                    .collect();
+                debug_assert_eq!(4 * 4, ARGS_MOST);
+                list2.WriteBufferImmediate(params.len() as u32, params.as_ptr(), None);
+                list.ResourceBarrier(&[transition(
+                    &args,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
                 list.SetComputeRootSignature(&sub.root);
                 for (param, arg) in &sub.roots {
                     if let Root::Constants(data) = arg {
@@ -1061,8 +1091,10 @@ impl Host {
                     }
                 }
                 list.SetComputeRootUnorderedAccessView(sub.uav_param, at);
+                list.SetComputeRootUnorderedAccessView(sub.args_param, args_at);
                 list.SetPipelineState(&sub.pso);
-                list.Dispatch(sub.groups, 1, 1);
+                // (More groups than the records hold: the ones past them return at once.)
+                list.Dispatch(sub.groups + 2, 1, 1);
                 list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -1072,10 +1104,34 @@ impl Host {
                         }),
                     },
                 }]);
+                list.ResourceBarrier(&[transition(
+                    &args,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
                 list.SetPipelineState(pso);
                 list.SetGraphicsRootUnorderedAccessView(sub.graphics_uav_param, at);
-                list.DrawInstanced(sub.layout.vertices_per_group(), sub.groups, 0, 0);
+                if sub.indirect {
+                    let arg = D3D12_INDIRECT_ARGUMENT_DESC {
+                        Type: D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+                        ..Default::default()
+                    };
+                    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+                        ByteStride: 16,
+                        NumArgumentDescs: 1,
+                        pArgumentDescs: &arg,
+                        NodeMask: 0,
+                    };
+                    let mut sig: Option<ID3D12CommandSignature> = None;
+                    dev.CreateCommandSignature(&desc, None, &mut sig).map_err(err)?;
+                    let sig = sig.ok_or("no command signature")?;
+                    list.ExecuteIndirect(&sig, 1, &args, 0, None, 0);
+                    keep_sigs.push(sig);
+                } else {
+                    list.DrawInstanced(sub.layout.vertices_per_group(), sub.groups, 0, 0);
+                }
                 keep.push(records);
+                keep.push(args);
             } else if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
@@ -1146,6 +1202,7 @@ impl Host {
             }
             readback.Unmap(0, None);
             drop(keep);
+            drop(keep_sigs);
             Ok(out)
         }
     }

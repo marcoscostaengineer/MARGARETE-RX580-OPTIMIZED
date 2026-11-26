@@ -411,6 +411,8 @@ pub(crate) struct MeshSubstitute {
     pub(crate) layout: victory_shader::emit::mesh_sub::MeshLayout,
     /// The root parameter of the record buffer (`SLOT_MESH_OUT`), for both.
     pub(crate) records_param: u32,
+    /// The root parameter of the argument slot (`SLOT_MESH_ARGS`), for the compute form.
+    pub(crate) args_param: u32,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -543,6 +545,7 @@ impl HostPipeline {
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
                             || slot == victory_shader::emit::mesh_sub::SLOT_MESH_OUT
+                            || slot == victory_shader::emit::mesh_sub::SLOT_MESH_ARGS
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -1053,12 +1056,9 @@ fn substitute_pipeline(
     shaders: &[Arc<Shader>],
 ) -> Option<HostPipeline> {
     use victory_shader::emit::mesh_sub;
-    let records_param = bound
-        .first()
-        .and_then(|s| s.root_uavs.iter().find(|r| r.0 == mesh_sub::SLOT_MESH_OUT))
-        .map(|r| r.1);
-    let Some(records_param) = records_param else {
-        return refuse("a mesh substitute that writes no records", shaders);
+    let param = |slot| bound.first().and_then(|s| s.root_uavs.iter().find(|r| r.0 == slot)).map(|r| r.1);
+    let (Some(records_param), Some(args_param)) = (param(mesh_sub::SLOT_MESH_OUT), param(mesh_sub::SLOT_MESH_ARGS)) else {
+        return refuse("a mesh substitute without its record and argument views", shaders);
     };
     let layout = match victory_shader::emit::mesh_layout(ms.container()) {
         Ok(layout) => layout,
@@ -1147,7 +1147,7 @@ fn substitute_pipeline(
         inputs: Vec::new(),
         rects: false,
         state: String::new(),
-        substitute: Some(MeshSubstitute { compute, layout, records_param }),
+        substitute: Some(MeshSubstitute { compute, layout, records_param, args_param }),
     })
 }
 

@@ -2138,10 +2138,11 @@ mod tests {
         )
         .ok();
         let mut ran = 0;
-        for (prim, culled) in [
-            (TRIANGLE, false),
-            (TRIANGLE | EDGE_FLAGS, false),
-            (TRIANGLE | EDGE_FLAGS | CULL, true),
+        for (prim, culled, indirect) in [
+            (TRIANGLE, false, false),
+            (TRIANGLE, false, true),
+            (TRIANGLE | EDGE_FLAGS, false, false),
+            (TRIANGLE | EDGE_FLAGS | CULL, true, true),
         ] {
             let cs = super::mesh_sub::as_compute(|| triangle_mesh(prim)).unwrap();
             let layout = super::mesh_sub::take_last().expect("a compute form's layout");
@@ -2158,6 +2159,7 @@ mod tests {
                 root_indexed_views: vec![],
             };
             assert!(cs.root_uavs.contains(&super::mesh_sub::SLOT_MESH_OUT));
+            assert!(cs.root_uavs.contains(&super::mesh_sub::SLOT_MESH_ARGS));
             if let Some(v) = validator.as_mut() {
                 v.validate(&mut cs.dxil.clone()).unwrap_or_else(|e| panic!("compute form: {e}"));
                 v.validate(&mut vs.dxil.clone()).unwrap_or_else(|e| panic!("vertex form: {e}"));
@@ -2199,7 +2201,10 @@ mod tests {
                             root: croot,
                             pso: cpso,
                             roots: vec![(0, Root::Constants(vec![0]))],
-                            uav_param: 1,
+                            // (root views by slot: u251 the arguments, u252 the records)
+                            args_param: 1,
+                            uav_param: 2,
+                            indirect,
                             graphics_uav_param: 2,
                             groups: 3,
                             layout: layout.clone(),
@@ -2215,7 +2220,7 @@ mod tests {
                         "{label}, {prim:#x}: {lit} of 256 texels lit"
                     );
                 }
-                eprintln!("{label}: substitute drew {prim:#x} ({lit} texels lit)");
+                eprintln!("{label}: substitute drew {prim:#x}{} ({lit} texels lit)", if indirect { " indirectly" } else { "" });
                 ran += 1;
             }
         }
