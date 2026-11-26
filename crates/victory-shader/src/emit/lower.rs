@@ -321,6 +321,8 @@ struct Lower<'a> {
     console_lanes: bool,
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
+    /// Mesh, compute form (`mesh_sub`): the byte where the group's record starts.
+    mesh_base: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
@@ -2118,6 +2120,7 @@ impl<'a> Lower<'a> {
             partial_active: None,
             wave_base: None,
             flat: None,
+            mesh_base: None,
             no_barrier,
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
@@ -2856,6 +2859,9 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        if self.s.mesh_compute {
+            super::mesh_sub::lowered(self.mesh_layout());
+        }
         Ok(Lowered {
             wave_size,
             cmp_samplers,
@@ -5218,8 +5224,14 @@ impl<'a> Lower<'a> {
             self.s.m.i32(mesh.max_vertices),
             self.s.m.i32(mesh.max_primitives),
         );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        let compute = super::mesh_sub::on();
+        if compute {
+            self.s.mesh_compute = true;
+            self.s.mesh = Some(mesh);
+        } else {
+            self.s
+                .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        }
         let flat = self.mesh_thread();
         let z = self.s.m.i32(0);
         // Every primitive of the declared count starts culled, also those
@@ -5238,14 +5250,22 @@ impl<'a> Lower<'a> {
             let guard = ((pass + 1) * threads > mesh.max_primitives)
                 .then(|| self.s.m.cmp(self.cur, pred::IULT, index, p));
             let at = self.begin_guarded(guard);
-            self.s.op(
-                self.cur,
-                "emitIndices",
-                Attr::NoUnwind,
-                void,
-                169,
-                &[index, z, z, z],
-            );
+            if compute {
+                let one = self.s.m.i32(1);
+                let (c, base) = (self.cur, self.mesh_base());
+                let layout = self.mesh_layout();
+                let byte = layout.prim_byte(&mut self.s, c, base, index, 0);
+                super::mesh_sub::store(&mut self.s, c, byte, &[z, z, z, one]);
+            } else {
+                self.s.op(
+                    self.cur,
+                    "emitIndices",
+                    Attr::NoUnwind,
+                    void,
+                    169,
+                    &[index, z, z, z],
+                );
+            }
             self.end_guarded(at, &[]);
         }
         Ok(())
@@ -5268,6 +5288,34 @@ impl<'a> Lower<'a> {
         );
         self.flat = Some(f);
         f
+    }
+
+    /// Mesh, compute form: the record layout so far (the elements' count and
+    /// order are fixed before the first store; their usage is not).
+    fn mesh_layout(&self) -> super::mesh_sub::MeshLayout {
+        let mesh = self.s.mesh.expect("mesh");
+        super::mesh_sub::MeshLayout {
+            max_vertices: mesh.max_vertices,
+            max_primitives: mesh.max_primitives,
+            vertex: self.s.outputs.clone(),
+            prims: self.s.prims.clone(),
+        }
+    }
+
+    /// Mesh, compute form: the byte where this group's record starts, made in
+    /// the entry block.
+    fn mesh_base(&mut self) -> V {
+        if let Some(b) = self.mesh_base {
+            return b;
+        }
+        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let layout = self.mesh_layout();
+        let e = self.s.entry;
+        let b = super::mesh_sub::group_base(&mut self.s, e, &layout, group);
+        self.mesh_base = Some(b);
+        b
     }
 
     /// The console wave size.
@@ -12987,6 +13035,19 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            if mesh && self.s.mesh_compute {
+                // The element's dword of this lane's vertex or primitive.
+                let (c, flat, base) = (self.cur, self.mesh_thread(), self.mesh_base());
+                let layout = self.mesh_layout();
+                let byte = if primitive {
+                    layout.prim_byte(&mut self.s, c, base, flat, 4 + 4 * id as u32 + u32::from(col))
+                } else {
+                    layout.vertex_byte(&mut self.s, c, base, flat, 4 * id as u32 + u32::from(col))
+                };
+                let x = if suffix == ".f32" { self.as_int(x) } else { x };
+                super::mesh_sub::store(&mut self.s, c, byte, &[x]);
+                continue;
+            }
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
@@ -13060,6 +13121,15 @@ impl<'a> Lower<'a> {
         let mut args = vec![flat];
         for i in indices {
             args.push(self.s.m.select(c, culled, z, i));
+        }
+        if self.s.mesh_compute {
+            let culled = self.s.m.cast(c, Cast::ZExt, culled, self.s.t.i32);
+            let base = self.mesh_base();
+            let layout = self.mesh_layout();
+            let byte = layout.prim_byte(&mut self.s, c, base, flat, 0);
+            super::mesh_sub::store(&mut self.s, c, byte, &[args[1], args[2], args[3], culled]);
+            self.end_guarded(at, &[]);
+            return Ok(());
         }
         let void = self.s.t.void;
         self.s

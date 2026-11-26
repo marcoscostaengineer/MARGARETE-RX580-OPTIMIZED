@@ -235,6 +235,10 @@ pub(crate) struct Shader {
     pub mesh: Option<Mesh>,
     /// A geometry shader (the rectangle stage, `rect.rs`); `pixel` is false.
     pub geometry: Option<Geometry>,
+    /// A mesh program emitted as its compute form (`mesh_sub`): `mesh` is
+    /// kept while lowering and dropped, with the output signatures, at
+    /// [`Shader::finish`].
+    pub mesh_compute: bool,
     /// Dwords of user data the shader reads (0: no user-data buffer).
     pub user_data: u32,
     /// Immediate samplers, bound as `s0..` in [`SAMPLER_SPACE`].
@@ -298,6 +302,7 @@ impl Shader {
             prims: Vec::new(),
             mesh: None,
             geometry: None,
+            mesh_compute: false,
             user_data: 0,
             samplers: 0,
             cmp_samplers: 0,
@@ -553,6 +558,12 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        if self.mesh_compute {
+            // A compute program: its outputs went to the record buffer.
+            self.mesh = None;
+            self.outputs.clear();
+            self.prims.clear();
+        }
         if self.pixel {
             // Reading a per-vertex value with attributeAtVertex needs a
             // constant input, even when the source declaration was smooth.

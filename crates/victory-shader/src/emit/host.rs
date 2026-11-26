@@ -744,6 +744,21 @@ pub enum Root {
     },
 }
 
+/// The compute half of [`Host::draw_substitute`].
+#[cfg(test)]
+pub struct Substitute {
+    pub root: ID3D12RootSignature,
+    pub pso: ID3D12PipelineState,
+    /// Compute root arguments (constants only).
+    pub roots: Vec<(u32, Root)>,
+    /// The compute root parameter of `u<SLOT_MESH_OUT>`.
+    pub uav_param: u32,
+    /// The graphics root parameter of `u<SLOT_MESH_OUT>`.
+    pub graphics_uav_param: u32,
+    pub groups: u32,
+    pub layout: super::mesh_sub::MeshLayout,
+}
+
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
 #[cfg(test)]
 pub struct Draw<'a> {
@@ -768,6 +783,29 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Draw,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with(root, pso, d, None)
+    }
+
+    /// Draws `groups` groups of a mesh program in its compute form
+    /// (`mesh_sub`): the compute pipeline writes the records, the graphics
+    /// pipeline `pso` (the vertex form and a pixel program) draws them.
+    pub fn draw_substitute(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        sub: &Substitute,
+    ) -> Result<Vec<[f32; 4]>, String> {
+        self.draw_with(root, pso, d, Some(sub))
+    }
+
+    fn draw_with(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Draw,
+        sub: Option<&Substitute>,
     ) -> Result<Vec<[f32; 4]>, String> {
         let dev = &self.device;
         let (w, h) = d.size;
@@ -1005,7 +1043,40 @@ impl Host {
                     }]),
                 );
             }
-            if d.mesh_groups > 0 {
+            if let Some(sub) = sub {
+                let records = make(
+                    D3D12_HEAP_TYPE_DEFAULT,
+                    &D3D12_RESOURCE_DESC {
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..buf_desc(u64::from(sub.groups * sub.layout.group_bytes()).max(4))
+                    },
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    None,
+                )?;
+                let at = records.GetGPUVirtualAddress();
+                list.SetComputeRootSignature(&sub.root);
+                for (param, arg) in &sub.roots {
+                    if let Root::Constants(data) = arg {
+                        list.SetComputeRoot32BitConstants(*param, data.len() as u32, data.as_ptr().cast(), 0);
+                    }
+                }
+                list.SetComputeRootUnorderedAccessView(sub.uav_param, at);
+                list.SetPipelineState(&sub.pso);
+                list.Dispatch(sub.groups, 1, 1);
+                list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: std::mem::transmute_copy(&records),
+                        }),
+                    },
+                }]);
+                list.SetPipelineState(pso);
+                list.SetGraphicsRootUnorderedAccessView(sub.graphics_uav_param, at);
+                list.DrawInstanced(sub.layout.vertices_per_group(), sub.groups, 0, 0);
+                keep.push(records);
+            } else if d.mesh_groups > 0 {
                 let list6: ID3D12GraphicsCommandList6 = list.cast().map_err(err)?;
                 list6.DispatchMesh(d.mesh_groups, 1, 1);
             } else {

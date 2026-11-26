@@ -91,6 +91,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub mod mesh_sub;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -2070,6 +2071,112 @@ mod tests {
         if ran == 0 {
             eprintln!("no device with mesh shaders; skipped");
         }
+    }
+
+    /// The triangle mesh program in its compute form (`mesh_sub`), drawn by
+    /// the vertex form on the host GPU and on WARP: what the mesh form draws
+    /// (`edge_flagged_triangles_draw_as_unflagged_ones`), on hosts without
+    /// mesh shaders too. Several groups, so each reads its own record.
+    #[test]
+    #[cfg(windows)]
+    fn mesh_substitute_draws_as_the_mesh_program() {
+        use super::host::{Draw, Host, Root, Substitute};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_VERTEX,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let ps_shader = super::host::stub_ps();
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let mut ran = 0;
+        for (prim, culled) in [
+            (TRIANGLE, false),
+            (TRIANGLE | EDGE_FLAGS, false),
+            (TRIANGLE | EDGE_FLAGS | CULL, true),
+        ] {
+            let cs = super::mesh_sub::as_compute(|| triangle_mesh(prim)).unwrap();
+            let layout = super::mesh_sub::take_last().expect("a compute form's layout");
+            assert_eq!((layout.max_vertices, layout.max_primitives), (32, 32));
+            let vs = HostShader {
+                stage: HwStage::Vs,
+                dxil: super::mesh_sub::vertex_program(&layout),
+                user_data: vec![],
+                samplers: vec![],
+                static_samplers: vec![],
+                root_cbvs: vec![],
+                root_srvs: vec![],
+                root_uavs: vec![super::mesh_sub::SLOT_MESH_OUT],
+                root_indexed_views: vec![],
+            };
+            assert!(cs.root_uavs.contains(&super::mesh_sub::SLOT_MESH_OUT));
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut cs.dxil.clone()).unwrap_or_else(|e| panic!("compute form: {e}"));
+                v.validate(&mut vs.dxil.clone()).unwrap_or_else(|e| panic!("vertex form: {e}"));
+            }
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let croot = host
+                    .root_signature_for(&[(&cs, D3D12_SHADER_VISIBILITY_ALL)])
+                    .unwrap();
+                let cpso = host
+                    .compute_pipeline_with(&croot, &cs.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: compute form: {e}"));
+                let root = host
+                    .root_signature_for(&[
+                        (&vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                        (&ps_shader, D3D12_SHADER_VISIBILITY_PIXEL),
+                    ])
+                    .unwrap();
+                let pso = host
+                    .pipeline_with(&root, &vs.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: vertex form: {e}"));
+                let texels = host
+                    .draw_substitute(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 0,
+                        },
+                        &Substitute {
+                            root: croot,
+                            pso: cpso,
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            uav_param: 1,
+                            graphics_uav_param: 2,
+                            groups: 3,
+                            layout: layout.clone(),
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                } else {
+                    assert!(
+                        texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                        "{label}, {prim:#x}: {lit} of 256 texels lit"
+                    );
+                }
+                eprintln!("{label}: substitute drew {prim:#x} ({lit} texels lit)");
+                ran += 1;
+            }
+        }
+        assert!(ran > 0, "no device ran the substitute");
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE
