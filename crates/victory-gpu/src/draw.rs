@@ -1775,6 +1775,10 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::mesh_sub::SLOT_MESH_OUT {
+                    // Ours: a mesh substitute's records, bound where it runs.
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -3260,6 +3264,19 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && let Some(sub) = &p.substitute
+        {
+            let ran = mesh_test() != 1 && mesh_kept(self.pipeline) && self.substitute_mesh(list, p, sub, x);
+            if ran {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -3291,6 +3308,71 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A mesh dispatch of `x` groups in the substitute form
+    /// (`victory_shader::emit::mesh_sub`): the compute form writes the groups' records into the
+    /// ring (`crate::mesh_ring`), then the vertex form draws them, an instance a group. False if
+    /// it must be dropped.
+    fn substitute_mesh(
+        &mut self,
+        list: &HostList,
+        p: &crate::pipeline::host::HostPipeline,
+        sub: &crate::pipeline::host::MeshSubstitute,
+        x: u32,
+    ) -> bool {
+        let Some(ring) = crate::mesh_ring::ring() else {
+            return false;
+        };
+        let per = u64::from(sub.layout.group_bytes()).max(1);
+        let fit = u32::try_from(ring.most() / per).unwrap_or(u32::MAX);
+        let groups = x.min(65_535).min(fit);
+        if groups < x {
+            once!(x, "a mesh dispatch of more groups than its records leave room for: cut");
+        }
+        if groups == 0 {
+            return true;
+        }
+        let (at, wrapped) = ring.take(u64::from(groups) * per);
+        // The compute form, on the pipeline's root signature with the same arguments.
+        if !self.bind(list, p, true) {
+            return false;
+        }
+        list.keep(&sub.compute);
+        list.keep(&ring.buffer);
+        let l = &list.list;
+        // SAFETY: an open list with the root signature and arguments set; the ring and the
+        // pipelines are kept alive by the list.
+        unsafe {
+            if wrapped {
+                l.ResourceBarrier(&[crate::mesh_ring::uav_barrier()]);
+            }
+            l.SetComputeRootUnorderedAccessView(sub.records_param, at);
+            l.SetPipelineState(&sub.compute);
+            l.Dispatch(groups, 1, 1);
+            l.ResourceBarrier(&[crate::mesh_ring::uav_barrier()]);
+        }
+        // (`prepare_for` sets the vertex form's pipeline again.)
+        self.host_pipeline = sub.compute.as_raw() as usize;
+        if !self.prepare_for(list, false, true) {
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("mesh {x} (substitute, {groups} groups)"), false));
+        self.mesh_scissor(list, true);
+        // SAFETY: an open list with everything set.
+        unsafe {
+            l.SetGraphicsRootUnorderedAccessView(sub.records_param, at);
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            l.DrawInstanced(sub.layout.vertices_per_group(), groups, 0, 0);
+        }
+        self.mesh_scissor(list, false);
+        // The title's own topology for its draws after this one.
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        self.drew(list, Some(p));
+        true
     }
 
     /// The walls trace (`crate::host::walls_trace`): one log line per

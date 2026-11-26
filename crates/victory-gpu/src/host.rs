@@ -1054,6 +1054,16 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // Mesh programs on a GPU without mesh shaders (GCN, Pascal and older) run in their
+        // compute form, drawn by a vertex program (`victory_shader::emit::mesh_sub`).
+        // `VICTORY_MESH_SUBSTITUTE=1` takes that form on any GPU (to try it), `=0` never.
+        let substitute = match std::env::var("VICTORY_MESH_SUBSTITUTE").ok().as_deref().map(str::trim) {
+            Some("1") => true,
+            Some("0") => false,
+            _ => !device_mesh_shaders(&device),
+        };
+        tracing::info!(substitute, "mesh programs in their compute form");
+        victory_shader::emit::mesh_sub::set_host_mesh_shaders(!substitute);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
@@ -4118,31 +4128,7 @@ impl Host {
     pub(crate) fn mesh_shaders(&self) -> bool {
         static MESH: OnceLock<bool> = OnceLock::new();
         *MESH.get_or_init(|| {
-            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
-            let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
-                HighestShaderModel: D3D_SHADER_MODEL_6_6,
-            };
-            // SAFETY: each query writes its own structure of the given size.
-            let ok = unsafe {
-                self.device
-                    .CheckFeatureSupport(
-                        D3D12_FEATURE_D3D12_OPTIONS7,
-                        (&raw mut options).cast(),
-                        size_of_val(&options) as u32,
-                    )
-                    .is_ok()
-                    && self
-                        .device
-                        .CheckFeatureSupport(
-                            D3D12_FEATURE_SHADER_MODEL,
-                            (&raw mut model).cast(),
-                            size_of_val(&model) as u32,
-                        )
-                        .is_ok()
-            };
-            let mesh = ok
-                && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
-                && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0;
+            let mesh = device_mesh_shaders(&self.device);
             tracing::info!(mesh, "host mesh shader support");
             mesh
         })
@@ -11318,3 +11304,30 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
     }
 }
 
+/// Whether `device` runs mesh shaders at shader model 6.6 (translated mesh
+/// shaders need both).
+fn device_mesh_shaders(device: &ID3D12Device) -> bool {
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+        HighestShaderModel: D3D_SHADER_MODEL_6_6,
+    };
+    // SAFETY: each query writes its own structure of the given size.
+    let ok = unsafe {
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS7,
+                (&raw mut options).cast(),
+                size_of_val(&options) as u32,
+            )
+            .is_ok()
+            && device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut model).cast(),
+                    size_of_val(&model) as u32,
+                )
+                .is_ok()
+    };
+    ok && options.MeshShaderTier != D3D12_MESH_SHADER_TIER_NOT_SUPPORTED
+        && model.HighestShaderModel.0 >= D3D_SHADER_MODEL_6_6.0
+}

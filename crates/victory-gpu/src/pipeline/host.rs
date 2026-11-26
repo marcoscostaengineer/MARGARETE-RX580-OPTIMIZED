@@ -394,10 +394,23 @@ pub(crate) struct HostPipeline {
     pub(crate) rects: bool,
     /// Its shaders, for reports of slow submissions.
     pub(crate) name: String,
+    /// A mesh pipeline on a host without mesh shaders
+    /// (`victory_shader::emit::mesh_sub`): `pso` draws the records with the
+    /// vertex form, after this computes them.
+    pub(crate) substitute: Option<MeshSubstitute>,
     /// Its depth, stencil, cull and blend state in short, for the frame
     /// listing (empty for compute).
     #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(crate) state: String,
+}
+
+/// The compute half of a mesh pipeline in its substitute form.
+pub(crate) struct MeshSubstitute {
+    /// The mesh program's compute form, on the pipeline's root signature.
+    pub(crate) compute: ID3D12PipelineState,
+    pub(crate) layout: victory_shader::emit::mesh_sub::MeshLayout,
+    /// The root parameter of the record buffer (`SLOT_MESH_OUT`), for both.
+    pub(crate) records_param: u32,
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
@@ -434,10 +447,14 @@ impl HostPipeline {
             );
         }
         let mesh = find("mesh");
+        // Without mesh shaders the mesh stage is its compute form, whose root
+        // arguments the compute and the vertex form both read.
+        let substitute = mesh.is_some() && !victory_shader::emit::mesh_sub::host_mesh_shaders();
         let stages = if let Some(cs) = compute {
             vec![(cs, D3D12_SHADER_VISIBILITY_ALL)]
         } else {
             let first = match (mesh, find("vertex")) {
+                (Some(ms), _) if substitute => (ms, D3D12_SHADER_VISIBILITY_ALL),
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
                 (None, None) => return refuse("no vertex or mesh shader", shaders),
@@ -446,7 +463,7 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        if mesh.is_some() && !substitute && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         {
@@ -525,6 +542,7 @@ impl HostPipeline {
                     // address and its fault notes.
                     let ours = if uav {
                         slot == victory_shader::emit::SLOT_FAULTS
+                            || slot == victory_shader::emit::mesh_sub::SLOT_MESH_OUT
                     } else {
                         slot == victory_shader::emit::SLOT_STRIDES
                             || slot == victory_shader::emit::SLOT_MEMORY
@@ -646,6 +664,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                substitute: None,
             });
         }
         let Some(g) = g else {
@@ -667,6 +686,9 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        if let Some(ms) = mesh.filter(|_| substitute) {
+            return substitute_pipeline(host, ms, &root, &root_blob, code(0), code(1), g, depth_bounds, &state, bound, shaders);
+        }
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -699,6 +721,7 @@ impl HostPipeline {
                 inputs: Vec::new(),
                 rects: false,
                 state: String::new(),
+                substitute: None,
             });
         }
 
@@ -814,6 +837,7 @@ impl HostPipeline {
             slots: g.slots(),
             inputs: g.elements(),
             rects: rect_gs.is_some(),
+            substitute: None,
             state: {
                 let (d, r, b) = (&g.depth, &g.rasterizer, &g.blend.RenderTarget[0]);
                 let face = |f: &D3D12_DEPTH_STENCILOP_DESC| {
@@ -1011,6 +1035,122 @@ fn mesh_pipeline(
 }
 
 /// The bytes of shader code (none for an absent stage).
+/// A mesh pipeline in its substitute form (`victory_shader::emit::mesh_sub`): the compute form
+/// of the mesh program (`ms`, translated so on this host) and a graphics pipeline of the vertex
+/// form and the pixel program with the title's graphics state, both on `root`.
+#[allow(clippy::too_many_arguments)]
+fn substitute_pipeline(
+    host: &crate::host::Host,
+    ms: &Arc<Shader>,
+    root: &ID3D12RootSignature,
+    root_blob: &[u8],
+    cs: D3D12_SHADER_BYTECODE,
+    ps: D3D12_SHADER_BYTECODE,
+    g: &GraphicsState,
+    depth_bounds: bool,
+    state: &str,
+    bound: Vec<Stage>,
+    shaders: &[Arc<Shader>],
+) -> Option<HostPipeline> {
+    use victory_shader::emit::mesh_sub;
+    let records_param = bound
+        .first()
+        .and_then(|s| s.root_uavs.iter().find(|r| r.0 == mesh_sub::SLOT_MESH_OUT))
+        .map(|r| r.1);
+    let Some(records_param) = records_param else {
+        return refuse("a mesh substitute that writes no records", shaders);
+    };
+    let layout = match victory_shader::emit::mesh_layout(ms.container()) {
+        Ok(layout) => layout,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "no mesh substitute layout");
+            return None;
+        }
+    };
+    let vs = mesh_sub::vertex_program(&layout);
+    let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+        // SAFETY: a borrowed pointer the description never releases.
+        pRootSignature: unsafe { std::mem::transmute_copy(root) },
+        CS: cs,
+        ..Default::default()
+    };
+    let name = super::library::name("mesh substitute compute", root_blob, &[&code_bytes(&cs)], "");
+    let compute = super::library::pipeline(
+        &name,
+        // SAFETY: the description points at live data.
+        |library, name| unsafe { library.LoadComputePipeline(name, &desc) },
+        // SAFETY: as above.
+        || unsafe { host.device.CreateComputePipelineState(&desc) },
+    );
+    let compute = match compute {
+        Ok(pso) => pso,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "host mesh substitute (compute form) refused");
+            host.log_messages();
+            return None;
+        }
+    };
+    let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        // SAFETY: a borrowed pointer the description never releases.
+        pRootSignature: unsafe { std::mem::transmute_copy(root) },
+        VS: D3D12_SHADER_BYTECODE {
+            pShaderBytecode: vs.as_ptr().cast(),
+            BytecodeLength: vs.len(),
+        },
+        PS: ps,
+        BlendState: host_blend(&g.blend, &g.targets),
+        SampleMask: g.sample_mask,
+        RasterizerState: g.rasterizer,
+        DepthStencilState: g.depth,
+        PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        NumRenderTargets: g.targets.NumRenderTargets,
+        RTVFormats: g.targets.RTFormats,
+        DSVFormat: g.depth_format,
+        SampleDesc: g.samples,
+        ..Default::default()
+    };
+    let name = super::library::name("mesh substitute", root_blob, &[&vs, &code_bytes(&ps)], state);
+    let made = if depth_bounds {
+        graphics_depth_bounds_pipeline(&host.device, root, &desc, g.depth1(), &name)
+    } else {
+        super::library::pipeline(
+            &name,
+            // SAFETY: the description points at live data.
+            |library, name| unsafe { library.LoadGraphicsPipeline(name, &desc) },
+            // SAFETY: as above.
+            || unsafe { host.device.CreateGraphicsPipelineState(&desc) },
+        )
+    };
+    let pso = match made {
+        Ok(pso) => pso,
+        Err(e) => {
+            tracing::warn!(error = %e, ?shaders, "host mesh substitute (vertex form) refused");
+            host.log_messages();
+            return None;
+        }
+    };
+    tracing::info!(
+        ?shaders,
+        groups_bytes = layout.group_bytes(),
+        "host mesh pipeline in its substitute form"
+    );
+    crate::host::name(&pso, || format!("{shaders:?} (substitute)"));
+    crate::host::name(&compute, || format!("{shaders:?} (substitute compute)"));
+    Some(HostPipeline {
+        compute: false,
+        mesh: true,
+        pso,
+        root: root.clone(),
+        stages: bound,
+        name: format!("{shaders:?}"),
+        slots: 0,
+        inputs: Vec::new(),
+        rects: false,
+        state: String::new(),
+        substitute: Some(MeshSubstitute { compute, layout, records_param }),
+    })
+}
+
 fn code_bytes(code: &D3D12_SHADER_BYTECODE) -> Vec<u8> {
     if code.pShaderBytecode.is_null() {
         return Vec::new();

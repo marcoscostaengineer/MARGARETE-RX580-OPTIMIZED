@@ -48,6 +48,8 @@ mod host;
 #[cfg(windows)]
 mod indirect;
 #[cfg(windows)]
+mod mesh_ring;
+#[cfg(windows)]
 mod inplace;
 #[cfg(windows)]
 mod port;
