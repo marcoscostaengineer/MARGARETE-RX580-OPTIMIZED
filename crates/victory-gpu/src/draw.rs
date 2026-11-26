@@ -3359,9 +3359,21 @@ impl State {
             Groups::Indirect { .. } => fit,
         };
         let taken = ring.take(list, u64::from(most) * per);
-        if !ring.begin(list, &taken, sub.layout.vertices_per_group(), most) {
-            return false;
-        }
+        // A direct dispatch's draw counts its groups here: one argument slot serves them all, and
+        // nothing moves between the dispatch and its draw but the records. An indirect one
+        // leaves its draw's instances in a slot of its own.
+        let indirect = matches!(groups, Groups::Indirect { .. });
+        let args = if indirect {
+            if !ring.begin(list, &taken, sub.layout.vertices_per_group(), most) {
+                return false;
+            }
+            taken.args
+        } else {
+            match ring.direct(list) {
+                Some(at) => at,
+                None => return false,
+            }
+        };
         // The compute form, on the pipeline's root signature with the same arguments.
         if !self.bind(list, p, true) {
             return false;
@@ -3372,7 +3384,7 @@ impl State {
         // argument records and the pipelines are kept alive by the list.
         unsafe {
             l.SetComputeRootUnorderedAccessView(sub.records_param, taken.records);
-            l.SetComputeRootUnorderedAccessView(sub.args_param, taken.args);
+            l.SetComputeRootUnorderedAccessView(sub.args_param, args);
             l.SetPipelineState(&sub.compute);
             match &groups {
                 Groups::Direct(_) => l.Dispatch(most, 1, 1),
@@ -3386,12 +3398,18 @@ impl State {
                 ),
             }
         }
-        ring.computed(list);
+        if indirect {
+            ring.computed(list);
+        } else {
+            ring.computed_records(list);
+        }
         // (`prepare_for` sets the vertex form's pipeline again.)
         self.host_pipeline = sub.compute.as_raw() as usize;
         if !self.prepare_for(list, false, true) {
-            // (The slot back to its state between dispatches.)
-            ring.drawn(list);
+            if indirect {
+                // (The slot back to its state between dispatches.)
+                ring.drawn(list);
+            }
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -3406,7 +3424,9 @@ impl State {
                 Groups::Indirect { .. } => l.ExecuteIndirect(&ring.draw, 1, &ring.args, taken.args_offset, None, 0),
             }
         }
-        ring.drawn(list);
+        if indirect {
+            ring.drawn(list);
+        }
         self.mesh_scissor(list, false);
         // The title's own topology for its draws after this one.
         if self.topology_set {

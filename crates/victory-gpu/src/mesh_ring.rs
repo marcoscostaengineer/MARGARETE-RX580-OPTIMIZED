@@ -42,6 +42,9 @@ pub(crate) struct Ring {
     pub(crate) dispatch: ID3D12CommandSignature,
     /// `ExecuteIndirect` of one draw record (an argument slot's first four dwords).
     pub(crate) draw: ID3D12CommandSignature,
+    /// The argument slot of direct dispatches ([`Ring::direct`]).
+    direct: ID3D12Resource,
+    direct_at: u64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the rest is atomic or fixed.
@@ -56,6 +59,9 @@ const ARGS_SLOTS: u64 = 1 << 16;
 /// [`HostList::first_use`] keys of the two buffers.
 const RECORDS_USE: usize = usize::MAX - 0x4d53_0001;
 const ARGS_USE: usize = usize::MAX - 0x4d53_0002;
+const DIRECT_USE: usize = usize::MAX - 0x4d53_0003;
+/// The most groups a mesh dispatch runs on the host.
+const MOST_GROUPS: u32 = 65_535;
 
 fn records_size() -> u64 {
     static SIZE: OnceLock<u64> = OnceLock::new();
@@ -131,6 +137,9 @@ pub(crate) fn ring() -> Option<&'static Ring> {
         let args = buffer(device, ARGS_SLOTS * u64::from(ARGS_BYTES), "mesh substitute draw arguments")?;
         let dispatch = signature(device, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, 12)?;
         let draw = signature(device, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 16)?;
+        let direct = buffer(device, 256, "mesh substitute direct arguments")?;
+        // SAFETY: a live buffer.
+        let direct_at = unsafe { direct.GetGPUVirtualAddress() };
         tracing::info!(mb = size >> 20, "buffer for mesh substitute records");
         // SAFETY: live buffers.
         let (records_base, args_base) = unsafe { (records.GetGPUVirtualAddress(), args.GetGPUVirtualAddress()) };
@@ -144,6 +153,8 @@ pub(crate) fn ring() -> Option<&'static Ring> {
             next_args: AtomicU64::new(0),
             dispatch,
             draw,
+            direct,
+            direct_at,
         })
     })
     .as_ref()
@@ -218,24 +229,51 @@ impl Ring {
         }
     }
 
+    /// The argument slot of direct dispatches in `list`: the most groups any dispatch runs, and
+    /// instances no draw reads (a direct draw counts its groups on the CPU). Written once a list
+    /// and left in the unordered-access state, so a direct dispatch moves no argument slot and
+    /// its draw waits for nothing but its records. `None` without `WriteBufferImmediate`.
+    pub(crate) fn direct(&self, list: &HostList) -> Option<u64> {
+        if list.first_use(DIRECT_USE) {
+            list.keep(&self.direct);
+            // SAFETY: an open list; the buffer lives as long as the process, in the common
+            // state at a list's start.
+            unsafe {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &self.direct,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )]);
+            }
+            if !write_args(list, self.direct_at, &[0, 0, 0, 0, MOST_GROUPS]) {
+                return None;
+            }
+            // SAFETY: as above.
+            unsafe {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    &self.direct,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                )]);
+            }
+        }
+        Some(self.direct_at)
+    }
+
+    /// After a direct dispatch: its records readable by the draw.
+    pub(crate) fn computed_records(&self, list: &HostList) {
+        // SAFETY: an open list; the buffer lives as long as the process.
+        unsafe { list.list.ResourceBarrier(&[uav_barrier_of(&self.records)]) };
+    }
+
     /// The argument slot `t` before its dispatch: a draw of `vertices` an instance and no
     /// instances yet, of at most `most` groups; then made writable for the dispatch.
     pub(crate) fn begin(&self, list: &HostList, t: &Taken, vertices: u32, most: u32) -> bool {
-        use windows::core::Interface;
-        let Ok(list2) = list.list.cast::<ID3D12GraphicsCommandList2>() else {
-            static SAID: OnceLock<()> = OnceLock::new();
-            SAID.get_or_init(|| tracing::warn!("no WriteBufferImmediate on this host: mesh substitute draws are dropped"));
+        if !write_args(list, t.args, &[vertices, 0, 0, 0, most]) {
             return false;
-        };
-        let words = [vertices, 0, 0, 0, most];
-        let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words
-            .iter()
-            .enumerate()
-            .map(|(n, &v)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: t.args + 4 * n as u64, Value: v })
-            .collect();
-        // SAFETY: an open list; the slot lies in a live buffer in the copy destination state.
+        }
+        // SAFETY: an open list; the slot lies in a live buffer.
         unsafe {
-            list2.WriteBufferImmediate(params.len() as u32, params.as_ptr(), None);
             list.list.ResourceBarrier(&[crate::host::transition(
                 &self.args,
                 D3D12_RESOURCE_STATE_COPY_DEST,
@@ -250,7 +288,7 @@ impl Ring {
         // SAFETY: an open list; the buffers live as long as the process.
         unsafe {
             list.list.ResourceBarrier(&[
-                uav_barrier(),
+                uav_barrier_of(&self.records),
                 crate::host::transition(
                     &self.args,
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
@@ -273,6 +311,39 @@ impl Ring {
     }
 }
 
+/// Writes `words` from GPU address `at` (in a buffer in the copy destination state) in `list`.
+/// False without `WriteBufferImmediate`.
+fn write_args(list: &HostList, at: u64, words: &[u32]) -> bool {
+    use windows::core::Interface;
+    let Ok(list2) = list.list.cast::<ID3D12GraphicsCommandList2>() else {
+        static SAID: OnceLock<()> = OnceLock::new();
+        SAID.get_or_init(|| tracing::warn!("no WriteBufferImmediate on this host: mesh substitute draws are dropped"));
+        return false;
+    };
+    let params: Vec<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> = words
+        .iter()
+        .enumerate()
+        .map(|(n, &v)| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER { Dest: at + 4 * n as u64, Value: v })
+        .collect();
+    // SAFETY: an open list; the caller names a live buffer in the copy destination state.
+    unsafe { list2.WriteBufferImmediate(params.len() as u32, params.as_ptr(), None) };
+    true
+}
+
+/// A UAV barrier over the unordered accesses of `resource` alone.
+fn uav_barrier_of(resource: &ID3D12Resource) -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                // SAFETY: a borrowed pointer the barrier never releases.
+                pResource: unsafe { std::mem::transmute_copy(resource) },
+            }),
+        },
+    }
+}
+
 /// A UAV barrier over every unordered access (the ring's records among them).
 pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
@@ -285,3 +356,58 @@ pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The argument slots hold what was written, in two lists one after another (each starts
+    /// with both buffers in the common state), through the states a dispatch takes them, and
+    /// the card stays alive. A direct slot is written once a list.
+    #[test]
+    fn argument_slots_hold_what_was_written() {
+        let (Some(host), Some(ring)) = (crate::host::host(), ring()) else {
+            return; // no host GPU here
+        };
+        for round in 0..2u32 {
+            let list = host.new_list().expect("a host list");
+            let direct = ring.direct(&list).expect("the direct slot");
+            assert_eq!(ring.direct(&list), Some(direct), "one direct slot a list");
+            let t = ring.take(&list, 1000);
+            assert!(t.records % ALIGN == 0, "records start on {ALIGN} bytes");
+            assert!(ring.begin(&list, &t, 96 + round, 7));
+            ring.computed(&list);
+            ring.drawn(&list);
+            ring.computed_records(&list);
+            let back = host.read_back_buffer(64).expect("a read back");
+            // SAFETY: an open list; live buffers in the states named.
+            unsafe {
+                list.list.ResourceBarrier(&[
+                    crate::host::transition(&ring.args, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                    crate::host::transition(&ring.direct, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                ]);
+                list.list.CopyBufferRegion(&back, 0, &ring.args, t.args_offset, u64::from(ARGS_BYTES));
+                list.list.CopyBufferRegion(&back, 32, &ring.direct, 0, 32);
+            }
+            list.close();
+            host.execute(&[&list]);
+            // SAFETY: a plain query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok(), "the card is alive");
+            let mut words = [0u32; 16];
+            // SAFETY: a read-back buffer of 64 bytes the card has written and is done with.
+            unsafe {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).expect("map");
+                std::ptr::copy_nonoverlapping(p.cast::<u32>(), words.as_mut_ptr(), 16);
+                back.Unmap(0, None);
+            }
+            assert_eq!(words[..5], [96 + round, 0, 0, 0, 7], "the dispatch's slot");
+            assert_eq!(words[8..13], [0, 0, 0, 0, MOST_GROUPS], "the direct slot");
+        }
+        eprintln!("argument slots checked on the card in two lists");
+    }
+}
+
+#[cfg(test)]
+#[path = "mesh_ring_tests.rs"]
+mod draw_tests;

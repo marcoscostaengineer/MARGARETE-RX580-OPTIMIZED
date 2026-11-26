@@ -901,6 +901,9 @@ fn private_bytes() -> u64 {
 /// draws nothing at seconds per frame.
 static ON_FAILURE: OnceLock<fn(&str) -> !> = OnceLock::new();
 
+/// The first error the debug layer reported that no one has taken yet ([`Host::debug_error`]).
+static SEEN_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Sets what a host GPU failure does (the runtime's crash report).
 pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
@@ -977,7 +980,11 @@ fn create() -> windows::core::Result<Host> {
                 if let Ok(d1) = l.cast::<ID3D12Debug1>() {
                     d1.SetEnableGPUBasedValidation(true);
                 }
-                if let Ok(d2) = l.cast::<ID3D12Debug2>() {
+                // (`VICTORY_D3D12_GBV_STATES=1` keeps the state tracking: for tests of our own
+                // barriers, such as the mesh substitute's, where every resource is transitioned.)
+                if !crate::switch::on("VICTORY_D3D12_GBV_STATES")
+                    && let Ok(d2) = l.cast::<ID3D12Debug2>()
+                {
                     d2.SetGPUBasedValidationFlags(
                         D3D12_GPU_BASED_VALIDATION_FLAGS_DISABLE_STATE_TRACKING,
                     );
@@ -6260,6 +6267,12 @@ impl Host {
 
     /// Moves the debug layer's messages into our log; returns the first
     /// error among them.
+    /// Whether the D3D12 debug layer's messages are read (`VICTORY_D3D12_DEBUG=1`, diagnostics).
+    #[cfg(test)]
+    pub(crate) fn debug_layer(&self) -> bool {
+        self.messages.is_some()
+    }
+
     pub(crate) fn log_messages(&self) -> Option<String> {
         let Some(queue) = &self.messages else {
             return None;
@@ -6288,7 +6301,20 @@ impl Host {
             }
             queue.ClearStoredMessages();
         }
+        // (Kept for `debug_error`: submissions read the queue on their own, and a test that asks
+        // after its list ran would find it empty.)
+        if let Some(e) = &first_error {
+            SEEN_ERROR.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(|| e.clone());
+        }
         first_error
+    }
+
+    /// The first error the D3D12 debug layer reported since the last call, whoever read it out
+    /// of the queue (a submission does, [`Host::log_messages`]); `None` without the layer.
+    #[cfg(test)]
+    pub(crate) fn debug_error(&self) -> Option<String> {
+        let now = self.log_messages();
+        SEEN_ERROR.lock().unwrap_or_else(|e| e.into_inner()).take().or(now)
     }
 
     /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
