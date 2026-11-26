@@ -1,7 +1,15 @@
-# VIctory on an RX 7900 XTX
+# MARGARETE - RX580 OPTIMIZED
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
+A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), itself
+a fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies.
+
+This fork makes it run on GPUs without the features the title was made for,
+an **AMD Radeon RX 580** (GCN, 8 GB) first: mesh shaders in a compute form for
+cards without them, and the title's wave32 compute programs on cards with
+64-lane waves alone ([below](#gpus-without-mesh-shaders-rx-580-and-older)).
+The measurements under *Where it stands* are upstream's, on an RX 7900 XTX;
+none has been taken with the title on an RX 580 yet.
 
 ## The goal
 
@@ -61,7 +69,7 @@ the frame now is the one thread that submits the title's work to the card
 | `VICTORY_MESH_SUBSTITUTE` | Mesh programs on GPUs without mesh shaders (below); `1` on any GPU, `0` never |
 | `VICTORY_MESH_RING_MB` | The buffer of those programs' records (512 by default) |
 
-### GPUs without mesh shaders (branch `feat/mesh-shader-fallback`)
+### GPUs without mesh shaders (RX 580 and older)
 
 The title draws its world with mesh shaders, which GCN cards (RX 400/500, Vega), Pascal and
 older do not have. On such a card each mesh program now runs in a compute form that writes its
@@ -98,8 +106,8 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
+git clone https://github.com/marcoscostaengineer/MARGARETE-RX580-OPTIMIZED
+cd MARGARETE-RX580-OPTIMIZED
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play.ps1 -Exe <path of your copy's executable>
@@ -153,6 +161,9 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
 This is a tree of other people's work with more on top. The history is kept, and
 commits taken from elsewhere name the commit and its author.
 
+- **[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** by avatarmanz:
+  the fork this one started from (renderer patches, ahead-of-time shaders,
+  everything measured on the RX 7900 XTX).
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
   contributors: the loader, the runtime services, the Direct3D 12 back end and
   the shader recompiler.
