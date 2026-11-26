@@ -55,15 +55,32 @@ pub struct MeshSubstitute {
 }
 
 /// Translates the mesh program of console container `container` in its
-/// compute form (with the same second tries as [`super::translate`]).
+/// compute form (with the same second tries as [`super::translate`]), with
+/// the layout [`super::mesh_layout`] reads from the container, which is the
+/// one the translation used.
 pub fn translate(container: &[u8]) -> Result<MeshSubstitute, crate::ShaderError> {
     LAST.set(None);
     let compute = as_compute(|| super::translate(container))?;
-    let layout = LAST.take().ok_or(crate::ShaderError::Unsupported {
+    let layout = super::mesh_layout(container)?;
+    let lowered = LAST.take().ok_or(crate::ShaderError::Unsupported {
         offset: 0,
         what: "a mesh substitute of a program that is no mesh program",
     })?;
+    if !same_places(&layout, &lowered) {
+        return Err(crate::ShaderError::Unsupported {
+            offset: 0,
+            what: "a mesh substitute whose record the container does not describe",
+        });
+    }
     Ok(MeshSubstitute { compute, layout })
+}
+
+/// Whether two layouts put every output in the same place (usage aside).
+pub(crate) fn same_places(a: &MeshLayout, b: &MeshLayout) -> bool {
+    let names = |els: &[SigElement]| els.iter().map(|e| (e.name.clone(), e.index, e.kind)).collect::<Vec<_>>();
+    (a.max_vertices, a.max_primitives) == (b.max_vertices, b.max_primitives)
+        && names(&a.vertex) == names(&b.vertex)
+        && names(&a.prims) == names(&b.prims)
 }
 
 /// Runs `f` with mesh programs lowered as their compute form.
@@ -78,9 +95,22 @@ pub(crate) fn as_compute<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+static HOST_MESH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Tells the translator whether the host runs mesh shaders (the default):
+/// without them, mesh programs translate to their compute form.
+pub fn set_host_mesh_shaders(on: bool) {
+    HOST_MESH.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host runs mesh shaders, as [`set_host_mesh_shaders`] said.
+pub fn host_mesh_shaders() -> bool {
+    HOST_MESH.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether mesh programs lowered now take their compute form.
 pub(crate) fn on() -> bool {
-    AS_COMPUTE.get()
+    AS_COMPUTE.get() || !host_mesh_shaders()
 }
 
 /// Where a group's outputs lie in its record, in dwords from the record's

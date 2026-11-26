@@ -723,6 +723,66 @@ fn widen(
     }
 }
 
+/// Interpolation as DXC declares it by default (pixel inputs that are read
+/// get the mode their barycentrics say, in `lower`).
+fn default_interp(e: &container::SigElement) -> u8 {
+    match (e.kind, e.comp) {
+        (3, _) => 4,
+        // Constant, as DXC declares it (the AMD compiler crashed on a
+        // front face without a mode).
+        (13, _) => 1,
+        // Until a read says which mode (`lower`).
+        (28, _) => 2,
+        (0 | 6 | 7, 9) => 2,
+        (0, _) => 1,
+        _ => 0,
+    }
+}
+
+/// A mesh program's per-primitive outputs as translated: constant. The
+/// console never exports a primitive id or cull flag a mesh shader writes (it
+/// culls with the primitive export), so those rows are left out.
+fn mesh_prims(mut prims: Vec<container::SigElement>) -> Vec<container::SigElement> {
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    for e in &mut prims {
+        e.interp = 1;
+    }
+    prims
+}
+
+/// The record layout of the compute form of the mesh program in console
+/// container `container` (`mesh_sub`), as its translation lays it out.
+pub fn mesh_layout(container: &[u8]) -> Result<mesh_sub::MeshLayout, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Unsupported { offset: 0, what: "a container without a mesh program" })?;
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Err(ShaderError::Unsupported { offset: 0, what: "a mesh program without mesh state" });
+    };
+    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+        match c.part(fourcc) {
+            Some(part) => signature(part.data),
+            None => Ok(Vec::new()),
+        }
+    };
+    let mut vertex = sig(FourCC::OSG1)?;
+    for e in &mut vertex {
+        e.interp = default_interp(e);
+    }
+    Ok(mesh_sub::MeshLayout {
+        max_vertices: ms.max_vertices,
+        max_primitives: ms.max_primitives,
+        vertex,
+        prims: mesh_prims(sig(FourCC::PSG1)?),
+    })
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -745,17 +805,7 @@ fn emit_program(
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
-        e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
-            // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
-            // Until a read says which mode (`lower`).
-            (28, _) => 2,
-            (0 | 6 | 7, 9) => 2,
-            (0, _) => 1,
-            _ => 0,
-        };
+        e.interp = default_interp(e);
     }
     // (DexNom/VIctory 5f4c3df4.)
     if native.stage == HwStage::Vs
@@ -770,14 +820,7 @@ fn emit_program(
             e.interp = 5;
         }
     }
-    // Per-primitive outputs are constant. The console never exports a
-    // primitive id or cull flag a mesh shader writes (it culls with the
-    // primitive export), so those rows are left out.
-    let mut prims = sig(FourCC::PSG1)?;
-    prims.retain(|e| !matches!(e.kind, 10 | 30));
-    for e in &mut prims {
-        e.interp = 1;
-    }
+    let prims = mesh_prims(sig(FourCC::PSG1)?);
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.

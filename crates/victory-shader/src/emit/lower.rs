@@ -1516,8 +1516,14 @@ fn own_bits_on() -> bool {
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
-pub fn host_settings() -> [u32; 4] {
-    [host_max_wave(), super::shader::view_heap_limit(), super::shader::raw_views(), host_rdna()]
+pub fn host_settings() -> [u32; 5] {
+    [
+        host_max_wave(),
+        super::shader::view_heap_limit(),
+        super::shader::raw_views(),
+        host_rdna(),
+        u32::from(!super::mesh_sub::host_mesh_shaders()),
+    ]
 }
 
 static HOST_RDNA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -5206,7 +5212,9 @@ impl<'a> Lower<'a> {
         let fits = |m: super::shader::Mesh| {
             mesh_output_bytes(outputs, prims, m.max_vertices, m.max_primitives) <= MESH_OUTPUT_LIMIT
         };
-        if !fits(mesh) {
+        // (The compute form has no such cap: its record keeps the declared
+        // maxima, which `mesh_sub::layout` reads from the container.)
+        if !fits(mesh) && !super::mesh_sub::on() {
             mesh.max_vertices = mesh.max_vertices.min(threads);
             mesh.max_primitives = mesh.max_primitives.min(threads);
             // shortcut: outputs past the cap even at the lane count are
