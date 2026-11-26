@@ -91,6 +91,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+pub mod mesh_sub;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
@@ -722,6 +723,66 @@ fn widen(
     }
 }
 
+/// Interpolation as DXC declares it by default (pixel inputs that are read
+/// get the mode their barycentrics say, in `lower`).
+fn default_interp(e: &container::SigElement) -> u8 {
+    match (e.kind, e.comp) {
+        (3, _) => 4,
+        // Constant, as DXC declares it (the AMD compiler crashed on a
+        // front face without a mode).
+        (13, _) => 1,
+        // Until a read says which mode (`lower`).
+        (28, _) => 2,
+        (0 | 6 | 7, 9) => 2,
+        (0, _) => 1,
+        _ => 0,
+    }
+}
+
+/// A mesh program's per-primitive outputs as translated: constant. The
+/// console never exports a primitive id or cull flag a mesh shader writes (it
+/// culls with the primitive export), so those rows are left out.
+fn mesh_prims(mut prims: Vec<container::SigElement>) -> Vec<container::SigElement> {
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    for e in &mut prims {
+        e.interp = 1;
+    }
+    prims
+}
+
+/// The record layout of the compute form of the mesh program in console
+/// container `container` (`mesh_sub`), as its translation lays it out.
+pub fn mesh_layout(container: &[u8]) -> Result<mesh_sub::MeshLayout, ShaderError> {
+    let c = Container::parse(container)?;
+    let dxil = c
+        .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .ok_or(ShaderError::Malformed("no DXIL part"))?;
+    let native = crate::native_programs(dxil.data)?
+        .into_iter()
+        .find(|p| p.stage == HwStage::Ms)
+        .ok_or(ShaderError::Unsupported { offset: 0, what: "a container without a mesh program" })?;
+    let crate::native::StageIo::Ms(ms) = &native.io else {
+        return Err(ShaderError::Unsupported { offset: 0, what: "a mesh program without mesh state" });
+    };
+    let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+        match c.part(fourcc) {
+            Some(part) => signature(part.data),
+            None => Ok(Vec::new()),
+        }
+    };
+    let mut vertex = sig(FourCC::OSG1)?;
+    for e in &mut vertex {
+        e.interp = default_interp(e);
+    }
+    Ok(mesh_sub::MeshLayout {
+        max_vertices: ms.max_vertices,
+        max_primitives: ms.max_primitives,
+        vertex,
+        prims: mesh_prims(sig(FourCC::PSG1)?),
+    })
+}
+
 /// The translated program, and the wave size it requires of the host.
 fn emit_program(
     c: &Container,
@@ -744,17 +805,7 @@ fn emit_program(
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };
     for e in interpolated {
-        e.interp = match (e.kind, e.comp) {
-            (3, _) => 4,
-            // Constant, as DXC declares it (the AMD compiler crashed on a
-            // front face without a mode).
-            (13, _) => 1,
-            // Until a read says which mode (`lower`).
-            (28, _) => 2,
-            (0 | 6 | 7, 9) => 2,
-            (0, _) => 1,
-            _ => 0,
-        };
+        e.interp = default_interp(e);
     }
     // (DexNom/VIctory 5f4c3df4.)
     if native.stage == HwStage::Vs
@@ -769,14 +820,7 @@ fn emit_program(
             e.interp = 5;
         }
     }
-    // Per-primitive outputs are constant. The console never exports a
-    // primitive id or cull flag a mesh shader writes (it culls with the
-    // primitive export), so those rows are left out.
-    let mut prims = sig(FourCC::PSG1)?;
-    prims.retain(|e| !matches!(e.kind, 10 | 30));
-    for e in &mut prims {
-        e.interp = 1;
-    }
+    let prims = mesh_prims(sig(FourCC::PSG1)?);
     // A mesh group's id arrives multiplied by max(threads, vertices,
     // primitives) (the code divides by that); the thread count is in PSV0
     // from runtime info version 2 on.
@@ -2070,6 +2114,117 @@ mod tests {
         if ran == 0 {
             eprintln!("no device with mesh shaders; skipped");
         }
+    }
+
+    /// The triangle mesh program in its compute form (`mesh_sub`), drawn by
+    /// the vertex form on the host GPU and on WARP: what the mesh form draws
+    /// (`edge_flagged_triangles_draw_as_unflagged_ones`), on hosts without
+    /// mesh shaders too. Several groups, so each reads its own record.
+    #[test]
+    #[cfg(windows)]
+    fn mesh_substitute_draws_as_the_mesh_program() {
+        use super::host::{Draw, Host, Root, Substitute};
+        use windows::Win32::Graphics::Direct3D12::{
+            D3D12_SHADER_VISIBILITY_ALL, D3D12_SHADER_VISIBILITY_PIXEL, D3D12_SHADER_VISIBILITY_VERTEX,
+        };
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let ps = constant_color();
+        let ps_shader = super::host::stub_ps();
+        #[cfg(windows)]
+        let mut validator = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        )
+        .ok();
+        let mut ran = 0;
+        for (prim, culled, indirect) in [
+            (TRIANGLE, false, false),
+            (TRIANGLE, false, true),
+            (TRIANGLE | EDGE_FLAGS, false, false),
+            (TRIANGLE | EDGE_FLAGS | CULL, true, true),
+        ] {
+            let cs = super::mesh_sub::as_compute(|| triangle_mesh(prim)).unwrap();
+            let layout = super::mesh_sub::take_last().expect("a compute form's layout");
+            assert_eq!((layout.max_vertices, layout.max_primitives), (32, 32));
+            let vs = HostShader {
+                stage: HwStage::Vs,
+                dxil: super::mesh_sub::vertex_program(&layout),
+                user_data: vec![],
+                samplers: vec![],
+                static_samplers: vec![],
+                root_cbvs: vec![],
+                root_srvs: vec![],
+                root_uavs: vec![super::mesh_sub::SLOT_MESH_OUT],
+                root_indexed_views: vec![],
+            };
+            assert!(cs.root_uavs.contains(&super::mesh_sub::SLOT_MESH_OUT));
+            assert!(cs.root_uavs.contains(&super::mesh_sub::SLOT_MESH_ARGS));
+            if let Some(v) = validator.as_mut() {
+                v.validate(&mut cs.dxil.clone()).unwrap_or_else(|e| panic!("compute form: {e}"));
+                v.validate(&mut vs.dxil.clone()).unwrap_or_else(|e| panic!("vertex form: {e}"));
+            }
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let croot = host
+                    .root_signature_for(&[(&cs, D3D12_SHADER_VISIBILITY_ALL)])
+                    .unwrap();
+                let cpso = host
+                    .compute_pipeline_with(&croot, &cs.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: compute form: {e}"));
+                let root = host
+                    .root_signature_for(&[
+                        (&vs, D3D12_SHADER_VISIBILITY_VERTEX),
+                        (&ps_shader, D3D12_SHADER_VISIBILITY_PIXEL),
+                    ])
+                    .unwrap();
+                let pso = host
+                    .pipeline_with(&root, &vs.dxil, &ps)
+                    .unwrap_or_else(|e| panic!("{label}: vertex form: {e}"));
+                let texels = host
+                    .draw_substitute(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 0,
+                        },
+                        &Substitute {
+                            root: croot,
+                            pso: cpso,
+                            roots: vec![(0, Root::Constants(vec![0]))],
+                            // (root views by slot: u251 the arguments, u252 the records)
+                            args_param: 1,
+                            uav_param: 2,
+                            indirect,
+                            graphics_uav_param: 2,
+                            groups: 3,
+                            layout: layout.clone(),
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                let lit = texels.iter().filter(|t| t[3] != 0.0).count();
+                if culled {
+                    assert_eq!(lit, 0, "{label}, {prim:#x}: a culled triangle lit texels");
+                } else {
+                    assert!(
+                        texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                        "{label}, {prim:#x}: {lit} of 256 texels lit"
+                    );
+                }
+                eprintln!("{label}: substitute drew {prim:#x}{} ({lit} texels lit)", if indirect { " indirectly" } else { "" });
+                ran += 1;
+            }
+        }
+        assert!(ran > 0, "no device ran the substitute");
     }
 
     /// A pixel shader interpolating at sample positions (PERSP_SAMPLE

@@ -1014,6 +1014,18 @@ fn heap_buffer_pass(heap: &crate::descriptor::Heap, host: &crate::descriptor::ho
     found
 }
 
+/// The groups of a mesh dispatch in the substitute form.
+enum Groups<'a> {
+    Direct(u32),
+    /// One record of the title's (x, y, z) at byte `at` of `args`, run if the count at its
+    /// place in `count` (a buffer and a byte) is not 0.
+    Indirect {
+        args: &'a ID3D12Resource,
+        at: u64,
+        count: Option<(&'a ID3D12Resource, u64)>,
+    },
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -1775,6 +1787,12 @@ impl State {
                 }
             }
             for &(slot, param) in &stage.root_uavs {
+                if slot == victory_shader::emit::mesh_sub::SLOT_MESH_OUT
+                    || slot == victory_shader::emit::mesh_sub::SLOT_MESH_ARGS
+                {
+                    // Ours: a mesh substitute's records and arguments, bound where it runs.
+                    continue;
+                }
                 if slot == victory_shader::emit::SLOT_FAULTS {
                     // Ours: where shaders note the pages they found empty.
                     if let Some(m) = &memory {
@@ -3260,6 +3278,19 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+            && let Some(sub) = &p.substitute
+        {
+            let ran = mesh_test() != 1 && mesh_kept(self.pipeline) && self.substitute_mesh(list, p, sub, Groups::Direct(x));
+            if ran {
+                DRAWN.fetch_add(1, Ordering::Relaxed);
+            } else {
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                dropped(self.pipeline);
+            }
+            return;
+        }
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -3291,6 +3322,98 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// A mesh dispatch in the substitute form (`victory_shader::emit::mesh_sub`): the compute
+    /// form writes the groups' records into the ring (`crate::mesh_ring`) and raises its draw's
+    /// instances, then the vertex form draws them, an instance a group. False if it must be
+    /// dropped.
+    fn substitute_mesh(
+        &mut self,
+        list: &HostList,
+        p: &crate::pipeline::host::HostPipeline,
+        sub: &crate::pipeline::host::MeshSubstitute,
+        groups: Groups,
+    ) -> bool {
+        let Some(ring) = crate::mesh_ring::ring() else {
+            return false;
+        };
+        let per = u64::from(sub.layout.group_bytes()).max(1);
+        let fit = u32::try_from(ring.most() / per).unwrap_or(u32::MAX).min(65_535);
+        if fit == 0 {
+            once!("a mesh substitute whose one group passes the most a dispatch takes: dropped");
+            return false;
+        }
+        // Direct: the groups asked for, as many as fit. Indirect: room for as many as fit; the
+        // groups past them return at once.
+        let most = match groups {
+            Groups::Direct(x) => {
+                if x > fit {
+                    once!(x, "a mesh dispatch of more groups than its records leave room for: cut");
+                }
+                if x == 0 {
+                    return true;
+                }
+                x.min(fit)
+            }
+            Groups::Indirect { .. } => fit,
+        };
+        let taken = ring.take(list, u64::from(most) * per);
+        if !ring.begin(list, &taken, sub.layout.vertices_per_group(), most) {
+            return false;
+        }
+        // The compute form, on the pipeline's root signature with the same arguments.
+        if !self.bind(list, p, true) {
+            return false;
+        }
+        list.keep(&sub.compute);
+        let l = &list.list;
+        // SAFETY: an open list with the root signature and arguments set; the ring, the
+        // argument records and the pipelines are kept alive by the list.
+        unsafe {
+            l.SetComputeRootUnorderedAccessView(sub.records_param, taken.records);
+            l.SetComputeRootUnorderedAccessView(sub.args_param, taken.args);
+            l.SetPipelineState(&sub.compute);
+            match &groups {
+                Groups::Direct(_) => l.Dispatch(most, 1, 1),
+                Groups::Indirect { args, at, count } => l.ExecuteIndirect(
+                    &ring.dispatch,
+                    1,
+                    *args,
+                    *at,
+                    count.map(|c| c.0),
+                    count.map_or(0, |c| c.1),
+                ),
+            }
+        }
+        ring.computed(list);
+        // (`prepare_for` sets the vertex form's pipeline again.)
+        self.host_pipeline = sub.compute.as_raw() as usize;
+        if !self.prepare_for(list, false, true) {
+            // (The slot back to its state between dispatches.)
+            ring.drawn(list);
+            return false;
+        }
+        #[cfg(feature = "diagnostics")]
+        list.note_op(|| self.op_text(format!("mesh {most} (substitute)"), false));
+        self.mesh_scissor(list, true);
+        // SAFETY: an open list with everything set.
+        unsafe {
+            l.SetGraphicsRootUnorderedAccessView(sub.records_param, taken.records);
+            l.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            match groups {
+                Groups::Direct(_) => l.DrawInstanced(sub.layout.vertices_per_group(), most, 0, 0),
+                Groups::Indirect { .. } => l.ExecuteIndirect(&ring.draw, 1, &ring.args, taken.args_offset, None, 0),
+            }
+        }
+        ring.drawn(list);
+        self.mesh_scissor(list, false);
+        // The title's own topology for its draws after this one.
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        self.drew(list, Some(p));
+        true
     }
 
     /// The walls trace (`crate::host::walls_trace`): one log line per
@@ -4133,6 +4256,25 @@ impl State {
                 (bounded, 0)
             }
         };
+        if kind == MESH
+            && let Some(sub) = &p.substitute
+        {
+            // One record at a time: each needs its own records and argument slot.
+            // shortcut: an execution of several records is dropped (the title's are of one).
+            if max != 1 {
+                once!(max, "an indirect mesh execution of several records in the substitute form: dropped");
+                why("several mesh records in the substitute form");
+                return false;
+            }
+            let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            let groups = Groups::Indirect { args: &bounded, at, count };
+            if !self.substitute_mesh(list, p, sub, groups) {
+                why("mesh substitute not run");
+                return false;
+            }
+            DRAWN.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
