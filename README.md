@@ -69,10 +69,10 @@ xychart-beta
 ```mermaid
 timeline
     title Linha do tempo deste fork
-    PR #1 : Substituto de mesh shaders (compute + vertex shader gerado) : desenhos diretos e indiretos
-    PR #2 : Waves de 32 do console dentro de waves de 64 da placa (GCN)
-    PR #3 : Teste de descritores corrigido para o driver da RX 580 : barreiras dos desenhos diretos de 3 para 1 : validação pela camada de debug do D3D12
-    PR #4 : README com o novo nome, em português e inglês
+    PR 1 : Substituto de mesh shaders (compute + vertex shader gerado) : desenhos diretos e indiretos
+    PR 2 : Waves de 32 do console dentro de waves de 64 da placa (GCN)
+    PR 3 : Teste de descritores corrigido para o driver da RX 580 : barreiras dos desenhos diretos de 3 para 1 : validação pela camada de debug do D3D12
+    PR 4 : README com o novo nome, em português e inglês
 ```
 
 ### 1. Substituto de mesh shaders (PR #1)
@@ -85,9 +85,11 @@ jogo, sem mudanças. Placas com mesh shaders continuam no caminho original.
 ```mermaid
 flowchart LR
     subgraph Original["Placas com mesh shaders"]
+        direction LR
         MS["Mesh shader<br/>do jogo"] --> PS1["Pixel shader"]
     end
     subgraph Substituto["RX 580 (substituto)"]
+        direction LR
         CS["Compute shader<br/>(mesmo código traduzido)"] -->|"vértices +<br/>triângulos"| RING[("Buffer de registros<br/>u252, 512 MB")]
         RING --> VS["Vertex shader<br/>gerado"]
         VS --> PS2["Pixel shader<br/>(o mesmo)"]
@@ -127,6 +129,7 @@ flowchart TB
         subgraph B["Lanes 32–63 = wave B do console"]
             B1["as mesmas operações,<br/>só da metade B"]
         end
+        A ~~~ B
     end
 ```
 
@@ -211,10 +214,13 @@ RX 7900 XTX, ray tracing desligado. **Não são da RX 580.**
 ```mermaid
 xychart-beta
     title "Tempo por quadro na mesma cena (ms, menor é melhor)"
-    x-axis ["3 dias antes", "Sem patches (57-75)", "Series X, 1+2", "1, 2, 5", "1, 2, 5, 6", "1, 2, 5, 6, 7"]
+    x-axis ["Início", "Sem patches", "X: 1+2", "S: 1+2+5", "+6", "+7"]
     y-axis "ms por quadro" 0 --> 300
     bar [280, 66, 53, 47.3, 45.6, 44.9]
 ```
+
+*Início*: três dias antes, 280 ms. *Sem patches*: 57–75 ms (barra no meio, 66). *X: 1+2*: perfil
+Series X com os patches 1 e 2. *S*: perfil Series S com os patches 1, 2 e 5, depois +6 e +7.
 
 | | |
 |---|---|
@@ -376,10 +382,10 @@ xychart-beta
 ```mermaid
 timeline
     title This fork's timeline
-    PR #1 : Mesh shader substitute (compute + generated vertex shader) : direct and indirect draws
-    PR #2 : Console 32-lane waves inside the GPU's 64-lane waves (GCN)
-    PR #3 : Descriptor test fixed for the RX 580 driver : direct draw barriers from 3 to 1 : validated by the D3D12 debug layer
-    PR #4 : README with the new name, in Portuguese and English
+    PR 1 : Mesh shader substitute (compute + generated vertex shader) : direct and indirect draws
+    PR 2 : Console 32-lane waves inside the GPU's 64-lane waves (GCN)
+    PR 3 : Descriptor test fixed for the RX 580 driver : direct draw barriers from 3 to 1 : validated by the D3D12 debug layer
+    PR 4 : README with the new name, in Portuguese and English
 ```
 
 ### 1. Mesh shader substitute (PR #1)
@@ -392,9 +398,11 @@ everything to the title's unchanged pixel shader. Cards with mesh shaders keep t
 ```mermaid
 flowchart LR
     subgraph Original["GPUs with mesh shaders"]
+        direction LR
         MS["Title's<br/>mesh shader"] --> PS1["Pixel shader"]
     end
     subgraph Substitute["RX 580 (substitute)"]
+        direction LR
         CS["Compute shader<br/>(same translated code)"] -->|"vertices +<br/>triangles"| RING[("Record buffer<br/>u252, 512 MB")]
         RING --> VS["Generated<br/>vertex shader"]
         VS --> PS2["Pixel shader<br/>(unchanged)"]
@@ -434,6 +442,7 @@ flowchart TB
         subgraph B["Lanes 32–63 = console wave B"]
             B1["the same operations,<br/>of half B only"]
         end
+        A ~~~ B
     end
 ```
 
@@ -518,10 +527,14 @@ XTX, ray tracing off. **Not from the RX 580.**
 ```mermaid
 xychart-beta
     title "Frame time in the same scene (ms, lower is better)"
-    x-axis ["3 days earlier", "No patches (57-75)", "Series X, 1+2", "1, 2, 5", "1, 2, 5, 6", "1, 2, 5, 6, 7"]
+    x-axis ["Start", "No patches", "X: 1+2", "S: 1+2+5", "+6", "+7"]
     y-axis "ms per frame" 0 --> 300
     bar [280, 66, 53, 47.3, 45.6, 44.9]
 ```
+
+*Start*: three days earlier, 280 ms. *No patches*: 57–75 ms (the bar at the middle, 66). *X: 1+2*:
+Series X profile with patches 1 and 2. *S*: Series S profile with patches 1, 2 and 5, then +6
+and +7.
 
 | | |
 |---|---|
