@@ -1201,7 +1201,7 @@ mod tests {
         next.close();
         host.execute(&[&own.list, &next]);
         // With the debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics).
-        assert_eq!(host.log_messages(), None);
+        assert_eq!(host.debug_error(), None);
         assert_eq!(a_bytes[2000..2100], was[33..133]);
         assert_eq!(a_bytes[33..133], was[2000..2100]);
         assert_eq!(b_bytes[77..84], was[5001..5008]);
@@ -1334,7 +1334,7 @@ mod tests {
             a.keep(&upload);
             lists.extend([a, b, c]);
         }
-        assert_eq!(host.log_messages(), None);
+        assert_eq!(host.debug_error(), None);
         let done = DONE[1].load(Ordering::Relaxed) - before;
         eprintln!("{done} of 48 copies were done on the card, {} submissions waited", DONE[3].load(Ordering::Relaxed));
         eprintln!("settles for title memory under shader writes: {}", LATE_STATS[WHY_STALE].load(Ordering::Relaxed));

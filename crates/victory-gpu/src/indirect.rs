@@ -2487,7 +2487,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             return;
         };
         // What earlier tests left in the debug layer's queue, if it is on.
-        let _ = host.log_messages();
+        let _ = host.debug_error();
         let Ok(list) = host.new_list() else {
             return;
         };
@@ -2547,7 +2547,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         // With the debug layer on (`VICTORY_D3D12_DEBUG=1`, diagnostics):
         // every barrier recorded named the state the buffer was in. Read
         // before the submission, which moves the messages to the log.
-        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        assert_eq!(host.debug_error(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
 
@@ -2567,7 +2567,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         );
         assert_eq!(list.indirect_state(&b4), args);
         list.close();
-        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        assert_eq!(host.debug_error(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
     }
@@ -2672,7 +2672,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         let Ok(list) = host.new_list() else {
             return;
         };
-        let _ = host.log_messages();
+        let _ = host.debug_error();
         let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
         const KIND_DISPATCH: u32 = 2;
         const STRIDE: u32 = 12;
@@ -2734,7 +2734,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
                 list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
             }
             list.close();
-            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            assert_eq!(host.debug_error(), None, "the debug layer found an error");
             host.execute(&[&list]);
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
@@ -2754,7 +2754,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             list.list.ExecuteIndirect(&signature, 1, &scratch, 0, None, 0);
         }
         list.close();
-        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        assert_eq!(host.debug_error(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
         // SAFETY: the list has run; a mapped buffer.
@@ -2855,7 +2855,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             return;
         };
         // What earlier tests left in the debug layer's queue, if it is on.
-        let _ = host.log_messages();
+        let _ = host.debug_error();
         let Ok(list) = host.new_list() else {
             return;
         };
@@ -2929,7 +2929,7 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
             list.close();
             // With the debug layer on: nothing it objects to was recorded.
             // Read before the submission, which moves the messages to the log.
-            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            assert_eq!(host.debug_error(), None, "the debug layer found an error");
             host.execute(&[&list]);
             list.reset();
             // SAFETY: the list has run; a mapped buffer.
@@ -3206,7 +3206,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(host) = super::host() else {
             return;
         };
-        let _ = host.log_messages();
+        let _ = host.debug_error();
         let Ok(list) = host.new_list() else {
             return;
         };
@@ -3253,7 +3253,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 }
             }
             list.close();
-            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            assert_eq!(host.debug_error(), None, "the debug layer found an error");
             host.execute(&[&list]);
             list.reset();
             // SAFETY: the list has run; a mapped buffer.

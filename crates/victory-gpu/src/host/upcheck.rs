@@ -939,7 +939,7 @@ mod tests {
         assert!(wrong.is_empty());
         assert_eq!(found, 0);
         // With the debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics).
-        assert_eq!(host.log_messages(), None);
+        assert_eq!(host.debug_error(), None);
     }
 
     #[test]
@@ -1184,7 +1184,7 @@ mod tests {
         assert_eq!([holds[D], holds[D + 64], holds[D + 128], holds[D + 192], holds[S]], [2, 7, 0, 5, 9], "the card");
         assert_eq!(look(host), Some(0));
         // With the debug layer.
-        if let Some(said) = host.log_messages() {
+        if let Some(said) = host.debug_error() {
             eprintln!("{said}");
         }
     }
@@ -1284,7 +1284,7 @@ mod tests {
                     on_card.is_empty() && in_title.is_empty(),
                     "round {round}: words {on_card:x?} on the card and {in_title:x?} in title memory are not what was written last"
                 );
-                assert_eq!(host.log_messages(), None);
+                assert_eq!(host.debug_error(), None);
             }
         }
     }

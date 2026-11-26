@@ -407,3 +407,7 @@ mod tests {
         eprintln!("argument slots checked on the card in two lists");
     }
 }
+
+#[cfg(test)]
+#[path = "mesh_ring_tests.rs"]
+mod draw_tests;
