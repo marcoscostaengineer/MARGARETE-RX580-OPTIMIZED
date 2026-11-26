@@ -98,6 +98,25 @@ const fn vgpr(n: u8) -> u16 {
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
+/// The hardware GPU's narrowest wave (`WaveLaneCountMin`; 0 without one).
+pub(super) fn hardware_min_wave() -> u32 {
+    static MIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        use windows::Win32::Graphics::Direct3D12::{D3D12_FEATURE_D3D12_OPTIONS1, D3D12_FEATURE_DATA_D3D12_OPTIONS1};
+        let Ok(host) = Host::new(false) else {
+            return 0;
+        };
+        let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            host.device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS1, (&raw mut o).cast(), size_of_val(&o) as u32)
+                .is_ok()
+        };
+        if ok { o.WaveLaneCountMin } else { 0 }
+    })
+}
+
 fn build_valu_cs(body: &[u32]) -> HostShader {
     build_cs(body, 1, 0)
 }
@@ -163,6 +182,8 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
+    // (translated for the hardware GPU's narrowest wave, as a run translates for its GPU)
+    let was = lower::THREAD_MIN_WAVE.replace(Some(hardware_min_wave()));
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -173,8 +194,9 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    });
+    lower::THREAD_MIN_WAVE.set(was);
+    let lowered = lowered.expect("lower");
 
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -2069,6 +2091,8 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
     let io = io::raise(&p, &native).expect("io::raise");
+    // (translated for the hardware GPU's narrowest wave, as a run translates for its GPU)
+    let was = lower::THREAD_MIN_WAVE.replace(Some(hardware_min_wave()));
     let lowered = lower::lower(&lower::Parts {
         native: &native,
         p: &p,
@@ -2079,8 +2103,9 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-    })
-    .expect("lower");
+    });
+    lower::THREAD_MIN_WAVE.set(was);
+    let lowered = lowered.expect("lower");
 
     let shader = HostShader {
         stage: HwStage::Cs,

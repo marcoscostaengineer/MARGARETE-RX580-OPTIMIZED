@@ -78,11 +78,17 @@ fn native(cross: bool, fi: bool, bc: bool, alias: bool, wave64: bool) -> NativeP
 }
 
 fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderError> {
+    lowered_on(native, host_wave, 0)
+}
+
+/// [`lowered`] for a host whose narrowest wave is `min_wave` (0: not known).
+fn lowered_on(native: &NativeProgram, host_wave: u32, min_wave: u32) -> Result<HostShader, ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
     let io = io::raise(&p, native).expect("io");
     let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+    let was_min = lower::THREAD_MIN_WAVE.replace(Some(min_wave));
     let result = lower::lower(&lower::Parts {
         native,
         p: &p,
@@ -95,6 +101,7 @@ fn lowered(native: &NativeProgram, host_wave: u32) -> Result<HostShader, ShaderE
         mesh_stride: 0,
     });
     lower::TEST_HOST_WAVE.set(was);
+    lower::THREAD_MIN_WAVE.set(was_min);
     let result = result?;
     let shader = HostShader {
         stage: HwStage::Cs,
@@ -173,17 +180,23 @@ fn permlane_rows_and_inactive_sources() {
         ran += 1;
         eprintln!("permlane: testing row and EXEC cases on {backend}");
         for wave64 in [false, true] {
-            if options.WaveLaneCountMin > if wave64 { 64 } else { 32 } {
+            // A console wave32 program on a host of 64-lane waves alone runs two console waves
+            // to a host wave (`Lower::paired`).
+            if wave64 && options.WaveLaneCountMin > 64 {
                 eprintln!("{backend} does not support the requested console wave size; skipped");
                 continue;
+            }
+            if !wave64 && options.WaveLaneCountMin > 32 {
+                eprintln!("{backend}: wave32 as two console waves to a host wave of {}", options.WaveLaneCountMin);
             }
             for cross in [false, true] {
                 for fi in [false, true] {
                     for bc in [false, true] {
                         for alias in [false, true] {
-                            let shader = lowered(
+                            let shader = lowered_on(
                                 &native(cross, fi, bc, alias, wave64),
                                 options.WaveLaneCountMax,
+                                options.WaveLaneCountMin,
                             )
                             .expect("lower permlane");
                             let (root, pso) =
